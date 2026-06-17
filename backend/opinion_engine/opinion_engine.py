@@ -1,0 +1,475 @@
+"""
+ECHO — Multi-Dimensional Opinion Space (MDOS) Engine
+=====================================================
+
+Production-ready, vectorized opinion dynamics simulation engine implementing:
+  • Continuous bounded confidence intervals (Deffuant model)
+  • Categorical homophily via social distance metric
+  • Backfire repulsion for out-group interactions
+  • Scale-Free (Barabási–Albert) and Small-World (Watts–Strogatz) topologies
+  • Real-time polarization telemetry and influencer detection
+
+Spec Source: Social Model.pdf — ECHO Documentation Suite
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Optional
+
+import networkx as nx
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Constants & Agent Matrix Column Indices (7D Vector)
+# ---------------------------------------------------------------------------
+
+COL_POLITICAL = 0    # P_i ∈ [-1.0, 1.0] (Ideology: Left to Right)
+COL_ECONOMIC = 1     # E_i ∈ [ 0.0, 1.0] (Class: Poor to Rich)
+COL_RELIGION = 2     # R_i ∈ ℤ⁺          (Categorical Identity Group)
+COL_BELIEF = 3       # O_i ∈ [-1.0, 1.0] (Dynamic Narrative Opinion)
+COL_GULLIBILITY = 4  # μ_i ∈ [0.01, 0.4] (Individual Learning Rate)
+COL_AROUSAL = 5      # A_i ∈ [ 0.0, 1.0] (Dynamic Emotional State)
+COL_LITERACY = 6     # S_i ∈ [ 0.0, 1.0] (Skepticism/Media Literacy)
+
+INFLUENCER_PERCENTILE = 0.15  # Top 15% by belief delta magnitude
+FATIGUE_LIMIT = 10            # Consecutive backfires before unfollowing
+
+logger = logging.getLogger("echo.opinion_engine")
+
+
+class Topology(Enum):
+    """Supported network topology archetypes."""
+    SCALE_FREE = "scale_free"         # Barabási–Albert (Influencer Dynamics)
+    SMALL_WORLD = "small_world"       # Watts–Strogatz (Echo Chamber Dynamics)
+
+
+@dataclass
+class TopologyParams:
+    """Parameters for network generation."""
+    m: int = 3       # Scale-Free: edges to attach from a new node to existing nodes
+    k: int = 6       # Small-World: k nearest neighbors in a ring
+    p: float = 0.3   # Small-World: probability of rewiring each edge
+
+
+@dataclass
+class TickTelemetry:
+    """Telemetry snapshot for a single simulation tick."""
+    tick: int
+    polarization: float        # σ(beliefs) — standard deviation
+    avg_belief: float          # μ(beliefs) — mean network belief
+    edges_severed: int         # Cumulative total of unfollows/blocks
+    edges_formed: int          # Cumulative total of new homophilic connections formed
+    active_influencers: list[int] = field(default_factory=list)
+
+
+class OpinionEngine:
+    """
+    Multi-Dimensional Opinion Space (MDOS) simulation engine.
+
+    Manages an N-agent network where each agent is represented by a 7D
+    attribute vector. Agents update beliefs each tick via bounded confidence 
+    convergence (in-group) or backfire repulsion (out-group), governed by a 
+    pairwise social distance metric, individual gullibility, and emotional arousal.
+
+    Parameters
+    ----------
+    n_agents : int
+        Total number of agents in the network.
+    topology : Topology
+        Network structure archetype.
+    w_pol : float
+        Weight coefficient for political distance.
+    w_econ : float
+        Weight coefficient for economic distance.
+    w_rel : float
+        Weight coefficient for religious identity match.
+    d_tolerance : float
+        Base bounded confidence threshold. Scales dynamically with Arousal.
+    gamma : float
+        Backfire / polarization repulsion coefficient.
+    topology_params : TopologyParams, optional
+        Parameters specific to the chosen topology archetype.
+    n_religious_groups : int
+        Number of distinct religious/cultural groups.
+    seed : int, optional
+        Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        n_agents: int = 500,
+        topology: Topology = Topology.SMALL_WORLD,
+        w_pol: float = 0.4,
+        w_econ: float = 0.2,
+        w_rel: float = 0.4,
+        d_tolerance: float = 0.5,
+        gamma: float = 0.1,
+        topology_params: Optional[TopologyParams] = None,
+        n_religious_groups: int = 3,
+        seed: Optional[int] = None,
+        fatigue_limit: int = 10,
+        p_fact_checkers: float = 0.05,
+        custom_edges: Optional[list[list[int]]] = None,
+    ) -> None:
+        # Configuration
+        self.n_agents = n_agents
+        self.topology_type = topology
+        self.w_pol = w_pol
+        self.w_econ = w_econ
+        self.w_rel = w_rel
+        self.d_tolerance = d_tolerance
+        self.gamma = gamma
+        self.topology_params = topology_params or TopologyParams()
+        self.n_religious_groups = n_religious_groups
+        self.seed = seed
+        self.fatigue_limit = fatigue_limit
+        self.p_fact_checkers = p_fact_checkers
+        self.custom_edges = custom_edges
+
+        # Internal state & telemetry
+        self._tick: int = 0
+        self._history: list[TickTelemetry] = []
+        self._last_belief_delta: np.ndarray = np.zeros(n_agents, dtype=np.float64)
+        self._rng = np.random.default_rng(seed)
+
+        # Initialize the data matrices
+        self._agents = self._init_agents()
+        self._baseline_beliefs = self._agents[:, COL_BELIEF].copy()
+        self._graph, self._adjacency = self._init_network()
+        
+        # Structural state (Connection Fatigue)
+        self._fatigue = np.zeros((n_agents, n_agents), dtype=np.float64)
+        self._severed_edges = np.zeros((n_agents, n_agents), dtype=bool)
+        self._total_edges_severed = 0
+        self._total_edges_formed = 0
+
+        logger.info(
+            "OpinionEngine initialized: %d agents, topology=%s",
+            n_agents, topology.value,
+        )
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    def _init_agents(self) -> np.ndarray:
+        """Create the N×7 agent attribute matrix with random distributions."""
+        agents = np.empty((self.n_agents, 7), dtype=np.float64)
+
+        # Sociological Anchors
+        agents[:, COL_POLITICAL] = self._rng.uniform(-1.0, 1.0, self.n_agents)
+        agents[:, COL_ECONOMIC] = self._rng.uniform(0.0, 1.0, self.n_agents)
+        agents[:, COL_RELIGION] = self._rng.integers(1, self.n_religious_groups + 1, self.n_agents).astype(np.float64)
+        
+        # Dynamic State
+        agents[:, COL_BELIEF] = self._rng.uniform(-1.0, 1.0, self.n_agents)
+        
+        # Psychological Traits
+        agents[:, COL_GULLIBILITY] = self._rng.uniform(0.01, 0.4, self.n_agents)
+        agents[:, COL_AROUSAL] = np.zeros(self.n_agents)  # Network starts calm
+        agents[:, COL_LITERACY] = self._rng.uniform(0.0, 1.0, self.n_agents)
+
+        # Apply Fact-Checkers
+        n_fact_checkers = int(self.n_agents * self.p_fact_checkers)
+        if n_fact_checkers > 0:
+            fc_indices = self._rng.choice(self.n_agents, n_fact_checkers, replace=False)
+            agents[fc_indices, COL_LITERACY] = 1.0
+            agents[fc_indices, COL_GULLIBILITY] = 0.01
+            agents[fc_indices, COL_BELIEF] = 0.0
+
+        return agents
+
+    def _init_network(self) -> tuple[nx.Graph, np.ndarray]:
+        """Generate the network graph and its adjacency matrix."""
+        n = self.n_agents
+        params = self.topology_params
+
+        if self.custom_edges is not None:
+            graph = nx.Graph()
+            graph.add_nodes_from(range(n))
+            graph.add_edges_from(self.custom_edges)
+        elif self.topology_type == Topology.SCALE_FREE:
+            graph = nx.barabasi_albert_graph(n, params.m, seed=self.seed)
+        elif self.topology_type == Topology.SMALL_WORLD:
+            k = max(2, params.k if params.k % 2 == 0 else params.k + 1)
+            graph = nx.watts_strogatz_graph(n, k, params.p, seed=self.seed)
+        else:
+            raise ValueError(f"Unsupported topology: {self.topology_type}")
+
+        adjacency = nx.to_numpy_array(graph, dtype=np.float64)
+        return graph, adjacency
+
+    # ------------------------------------------------------------------
+    # Distance Computation
+    # ------------------------------------------------------------------
+
+    def _compute_social_distance_matrix(self) -> np.ndarray:
+        """Compute the N×N social distance matrix D(i,j) via broadcasting."""
+        P = self._agents[:, COL_POLITICAL]
+        E = self._agents[:, COL_ECONOMIC]
+        R = self._agents[:, COL_RELIGION].astype(np.int32)
+
+        pol_dist = np.abs(P[:, None] - P[None, :])
+        econ_dist = np.abs(E[:, None] - E[None, :])
+        rel_match = (R[:, None] == R[None, :]).astype(np.float64)
+
+        return (self.w_pol * pol_dist + self.w_econ * econ_dist - self.w_rel * rel_match)
+
+    # ------------------------------------------------------------------
+    # Core Physics Loop
+    # ------------------------------------------------------------------
+
+    def step(self) -> dict[str, Any]:
+        """Advance the simulation by one tick and process 7D dynamics."""
+        self._tick += 1
+        
+        # Arousal naturally decays by 20% every tick (cooling off period)
+        self._agents[:, COL_AROUSAL] *= 0.8
+        
+        old_beliefs = self._agents[:, COL_BELIEF].copy()
+        D = self._compute_social_distance_matrix()
+
+        # Compute all interactions and get new beliefs
+        new_beliefs = self._apply_opinion_dynamics(D, old_beliefs)
+
+        # Commit updates
+        self._agents[:, COL_BELIEF] = new_beliefs
+        self._last_belief_delta = np.abs(new_beliefs - old_beliefs)
+
+        # Telemetry aggregation
+        polarization = float(np.std(new_beliefs))
+        avg_belief = float(np.mean(new_beliefs))
+        active_influencers = self.get_active_influencers().tolist()
+
+        telemetry = TickTelemetry(
+            tick=self._tick,
+            polarization=polarization,
+            avg_belief=avg_belief,
+            edges_severed=self._total_edges_severed,
+            edges_formed=self._total_edges_formed,
+            active_influencers=active_influencers,
+        )
+        self._history.append(telemetry)
+
+        return {
+            "tick": self._tick,
+            "polarization": polarization,
+            "avg_belief": avg_belief,
+            "edges_severed": self._total_edges_severed,
+            "edges_formed": self._total_edges_formed,
+            "active_influencers": active_influencers,
+        }
+
+    def _apply_opinion_dynamics(self, D: np.ndarray, beliefs: np.ndarray) -> np.ndarray:
+        """Apply Convergence, Backfire, Literacy limits, and Structural Fatigue."""
+        adj = self._adjacency
+        
+        gullibility = self._agents[:, COL_GULLIBILITY] 
+        arousal = self._agents[:, COL_AROUSAL]         
+        base_literacy = self._agents[:, COL_LITERACY]       
+
+        # Confirmation Bias Mechanic:
+        # Extremism reduces media literacy and narrows tolerance further
+        extremism = np.abs(beliefs)
+        literacy = base_literacy * (1.0 - extremism)
+        
+        # High arousal and high extremism shrink tolerance bounds drastically
+        eff_tolerance = self.d_tolerance * (1.0 - arousal) * (1.0 - extremism * 0.5)
+        eff_tolerance_matrix = eff_tolerance[:, None]      
+
+        belief_diff = beliefs[None, :] - beliefs[:, None]
+
+        # ---- State A: Bounded Convergence ----
+        extreme_post = np.abs(beliefs[None, :]) > 0.8
+        skeptic_mask = (literacy[:, None] > 0.6) & extreme_post
+        
+        converge_mask = (adj > 0) & (D <= eff_tolerance_matrix) & ~skeptic_mask
+        converge_delta = gullibility[:, None] * (1.0 - D) * belief_diff
+        converge_delta *= converge_mask
+
+        # ---- State B: Backfire Repulsion ----
+        sign_i = np.sign(beliefs)[:, None]
+        sign_j = np.sign(beliefs)[None, :]
+        sign_mismatch = sign_i != sign_j
+
+        backfire_mask = (adj > 0) & (D > eff_tolerance_matrix) & sign_mismatch
+        backfire_delta = -self.gamma * D * np.sign(belief_diff)
+        backfire_delta *= backfire_mask
+
+        # ---- Dynamic State Updates (Psychology & Structure) ----
+        # 1. Arousal Spikes: Each backfire interaction adds 0.1 to arousal
+        backfire_counts = backfire_mask.sum(axis=1)
+        self._agents[:, COL_AROUSAL] = np.clip(arousal + (backfire_counts * 0.1), 0.0, 1.0)
+
+        # 2. Connection Fatigue: Track consecutive negative interactions
+        self._fatigue[backfire_mask] += 1
+        self._fatigue[converge_mask] = 0  # Reset on positive interaction
+
+        # Decay fatigue across the board for cooling down (Network Healing phase 1)
+        self._fatigue = np.maximum(0.0, self._fatigue - 0.2)
+
+        # 3. Unfollowing Logic: Sever edges that breach fatigue limit
+        sever_mask = self._fatigue >= self.fatigue_limit
+        if np.any(sever_mask):
+            severed_count = np.sum(adj[sever_mask] > 0)
+            self._total_edges_severed += int(severed_count)
+            
+            # Zero out adjacency bidirectionally and mark as severed
+            self._adjacency[sever_mask] = 0
+            self._adjacency[sever_mask.T] = 0 
+            self._severed_edges[sever_mask] = True
+            self._severed_edges[sever_mask.T] = True
+            # We don't reset fatigue to 0 immediately so it has to cool down before healing
+
+        # Network Healing phase 2: If fatigue has cooled down to 0 and edge was severed, probabilistically reform
+        heal_mask = self._severed_edges & (self._fatigue == 0.0) & (adj == 0)
+        # Small probability of healing per tick if cooled down
+        heal_prob_mask = self._rng.random((self.n_agents, self.n_agents)) < 0.05
+        active_heals = heal_mask & heal_prob_mask
+        active_heals = active_heals | active_heals.T
+
+        if np.any(active_heals):
+            self._total_edges_formed += int(np.sum(active_heals) // 2)
+            self._adjacency[active_heals] = 1.0
+            self._severed_edges[active_heals] = False
+
+        # 4. Edge Formation (Homophily): Unconnected nodes with similar beliefs randomly discover each other
+        unconnected_mask = (adj == 0) & (np.eye(self.n_agents) == 0)
+        homophily_mask = unconnected_mask & (np.abs(belief_diff) < 0.1)
+        
+        # 0.1% probability per tick to form an edge if highly aligned (to prevent instant clique formation)
+        form_prob_mask = self._rng.random((self.n_agents, self.n_agents)) < 0.001
+        new_edges_mask = homophily_mask & form_prob_mask
+        
+        # Make symmetric
+        new_edges_mask = new_edges_mask | new_edges_mask.T
+        
+        if np.any(new_edges_mask):
+            # Each undirected edge appears as 2 true values in the symmetric mask
+            formed_count = np.sum(new_edges_mask) // 2
+            self._total_edges_formed += int(formed_count)
+            self._adjacency[new_edges_mask] = 1.0
+            self._fatigue[new_edges_mask] = 0
+
+        # ---- Aggregate ----
+        total_delta = converge_delta + backfire_delta
+        active_neighbors = np.maximum((converge_mask | backfire_mask).sum(axis=1), 1.0)
+        mean_delta = total_delta.sum(axis=1) / active_neighbors
+
+        return np.clip(beliefs + mean_delta, -1.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # API Hooks & Getters
+    # ------------------------------------------------------------------
+
+    def get_active_influencers(self) -> np.ndarray:
+        """Returns indices of agents flagged for LLM generation."""
+        n_influencers = max(1, int(np.ceil(self.n_agents * INFLUENCER_PERCENTILE)))
+        top_indices = np.argpartition(self._last_belief_delta, -n_influencers)[-n_influencers:]
+        sorted_order = np.argsort(self._last_belief_delta[top_indices])[::-1]
+        return top_indices[sorted_order]
+
+    def get_telemetry(self) -> dict[str, Any]:
+        """Return comprehensive telemetry and history."""
+        if not self._history:
+            beliefs = self._agents[:, COL_BELIEF]
+            return {
+                "current_tick": 0,
+                "polarization": float(np.std(beliefs)),
+                "avg_belief": float(np.mean(beliefs)),
+                "edges_severed": 0,
+                "edges_formed": 0,
+                "history": [],
+            }
+        latest = self._history[-1]
+        return {
+            "current_tick": latest.tick,
+            "polarization": latest.polarization,
+            "avg_belief": latest.avg_belief,
+            "edges_severed": latest.edges_severed,
+            "edges_formed": latest.edges_formed,
+            "history": [
+                {
+                    "tick": t.tick,
+                    "polarization": t.polarization,
+                    "avg_belief": t.avg_belief,
+                    "edges_severed": t.edges_severed,
+                    "edges_formed": t.edges_formed,
+                    "n_influencers": len(t.active_influencers),
+                }
+                for t in self._history
+            ],
+        }
+
+    def get_agent_stubbornness(self, agent_id: int) -> float:
+        """Stubbornness trait is 1.0 minus gullibility."""
+        return float(1.0 - self._agents[agent_id, COL_GULLIBILITY])
+
+    def get_agent_baseline_belief(self, agent_id: int) -> float:
+        """Return the baseline belief at tick 0 for the agent."""
+        return float(self._baseline_beliefs[agent_id])
+
+    def get_agent_belief(self, agent_id: int) -> float:
+        """Return the current belief of the agent."""
+        return float(self._agents[agent_id, COL_BELIEF])
+
+    def get_agent_detail(self, agent_id: int) -> dict[str, Any]:
+        """Return the full 7D attribute detail for a single agent."""
+        row = self._agents[agent_id]
+        return {
+            "agent_id": agent_id,
+            "political": float(row[COL_POLITICAL]),
+            "economic": float(row[COL_ECONOMIC]),
+            "religion": int(row[COL_RELIGION]),
+            "belief": float(row[COL_BELIEF]),
+            "gullibility": float(row[COL_GULLIBILITY]),
+            "arousal": float(row[COL_AROUSAL]),
+            "literacy": float(row[COL_LITERACY]),
+            "last_belief_delta": float(self._last_belief_delta[agent_id]),
+        }
+
+    def get_agent_states(self) -> np.ndarray:
+        return self._agents.copy()
+
+    def get_adjacency(self) -> np.ndarray:
+        return self._adjacency.copy()
+
+    def get_graph(self) -> nx.Graph:
+        # Re-build graph from current adjacency to reflect severed edges
+        return nx.from_numpy_array(self._adjacency)
+
+    def inject_narrative(self, agent_id: int, belief_score: float) -> None:
+        """Force an agent to adopt a specific belief score (Patient Zero)."""
+        belief_score = np.clip(belief_score, -1.0, 1.0)
+        self._agents[agent_id, COL_BELIEF] = belief_score
+
+    def export_state_log(self, filepath: str | Path) -> None:
+        """Export tick history to a JSONL file."""
+        with open(Path(filepath), "w", encoding="utf-8") as f:
+            for record in self._history:
+                entry = {
+                    "tick": record.tick,
+                    "polarization": record.polarization,
+                    "avg_belief": record.avg_belief,
+                    "edges_severed": record.edges_severed,
+                    "edges_formed": record.edges_formed,
+                    "active_influencers": record.active_influencers,
+                }
+                f.write(json.dumps(entry) + "\n")
+
+    @property
+    def tick(self) -> int:
+        return self._tick
+
+    def __repr__(self) -> str:
+        beliefs = self._agents[:, COL_BELIEF]
+        return (
+            f"OpinionEngine(n={self.n_agents}, tick={self._tick}, "
+            f"polarization={np.std(beliefs):.4f}, "
+            f"severed_edges={self._total_edges_severed}, "
+            f"formed_edges={self._total_edges_formed})"
+        )
