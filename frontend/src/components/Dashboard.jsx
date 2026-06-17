@@ -3,7 +3,7 @@ import { useSimulationStore } from '../store/useSimulationStore';
 import VoxelCanvas from './VoxelCanvas';
 import { 
   Play, Pause, SkipForward, RefreshCw, Zap, Users, 
-  Settings, Award, Heart, HelpCircle, Activity, MessageSquare, Download
+  Settings, Award, Heart, HelpCircle, Activity, MessageSquare, Download, RotateCcw, Upload
 } from 'lucide-react';
 
 export default function Dashboard() {
@@ -35,7 +35,9 @@ export default function Dashboard() {
     defaultInjectionTemplate,
     fetchPrompts,
     updatePrompts,
-    exportSession
+    exportSession,
+    resetSimulation,
+    loadSession
   } = useSimulationStore();
 
   const [activeTab, setActiveTab] = useState('topology');
@@ -57,6 +59,25 @@ export default function Dashboard() {
     initializeSimulation();
     fetchPrompts();
   }, []);
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const json = JSON.parse(event.target.result);
+        loadSession(json);
+      } catch (err) {
+        alert("Failed to parse JSON file.");
+        console.error(err);
+      }
+    };
+    reader.readAsText(file);
+    // Clear input so same file can be uploaded again if needed
+    e.target.value = '';
+  };
 
   const selectedAgent = selectedAgentId !== null ? agents[selectedAgentId] : null;
 
@@ -490,13 +511,39 @@ export default function Dashboard() {
               
               <button 
                 className="rct-button" 
-                onClick={exportSession}
-                disabled={!isInitialized}
-                style={{ marginLeft: 'auto' }}
+                onClick={resetSimulation}
+                disabled={!isInitialized && currentTick === 0}
               >
-                <Download className="btn-icon" />
-                Export
+                <RotateCcw className="btn-icon" />
+                Reset
               </button>
+              
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: '4px' }}>
+                <input 
+                  type="file" 
+                  accept=".json" 
+                  id="session-upload" 
+                  style={{ display: 'none' }} 
+                  onChange={handleFileUpload}
+                />
+                <label 
+                  htmlFor="session-upload" 
+                  className="rct-button" 
+                  style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center' }}
+                >
+                  <Upload className="btn-icon" />
+                  Load
+                </label>
+                
+                <button 
+                  className="rct-button" 
+                  onClick={exportSession}
+                  disabled={!isInitialized}
+                >
+                  <Download className="btn-icon" />
+                  Export
+                </button>
+              </div>
             </div>
           </div>
         </section>

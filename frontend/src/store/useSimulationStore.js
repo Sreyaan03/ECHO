@@ -1,6 +1,57 @@
 import { create } from 'zustand';
 
-const API_BASE_URL = 'http://127.0.0.1:8000/api';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api';
+
+// Web Audio API Synthesizer
+let audioCtx = null;
+const initAudio = () => {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+};
+
+const playSound = (type, params = {}) => {
+  if (!audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  
+  const osc = audioCtx.createOscillator();
+  const gainNode = audioCtx.createGain();
+  
+  osc.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+  
+  const now = audioCtx.currentTime;
+  
+  if (type === 'tick') {
+    // Soft low pop
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(150, now);
+    osc.frequency.exponentialRampToValueAtTime(40, now + 0.1);
+    gainNode.gain.setValueAtTime(0.05, now);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+    osc.start(now);
+    osc.stop(now + 0.1);
+  } else if (type === 'sever') {
+    // Sharp snap, pitch based on count
+    const count = params.count || 1;
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(400 + Math.min(count * 20, 400), now);
+    osc.frequency.exponentialRampToValueAtTime(100, now + 0.1);
+    gainNode.gain.setValueAtTime(0.1, now);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+    osc.start(now);
+    osc.stop(now + 0.1);
+  } else if (type === 'inject') {
+    // Digital chime
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(600, now);
+    osc.frequency.exponentialRampToValueAtTime(1200, now + 0.2);
+    gainNode.gain.setValueAtTime(0.15, now);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+    osc.start(now);
+    osc.stop(now + 0.3);
+  }
+};
 
 export const useSimulationStore = create((set, get) => ({
   // Simulation Configuration
@@ -67,6 +118,8 @@ export const useSimulationStore = create((set, get) => ({
       set({ playInterval: null, isPlaying: false });
     }
 
+    initAudio();
+
     try {
       const response = await fetch(`${API_BASE_URL}/initialize`, {
         method: 'POST',
@@ -122,6 +175,13 @@ export const useSimulationStore = create((set, get) => ({
       const telRes = await fetch(`${API_BASE_URL}/telemetry`);
       const telemetryData = telRes.ok ? await telRes.json() : get().telemetry;
 
+      // Audio Feedback
+      playSound('tick');
+      const newlySevered = data.edges_severed - get().edgesSevered;
+      if (newlySevered > 0) {
+        playSound('sever', { count: newlySevered });
+      }
+
       set({
         currentTick: data.tick,
         agents: updatedAgents,
@@ -163,6 +223,9 @@ export const useSimulationStore = create((set, get) => ({
         agents: updatedAgents,
         mutatedNarratives: data.narrative_logs || []
       });
+      
+      initAudio();
+      playSound('inject');
       
       if (get().selectedAgentId === agentId) {
         // Refresh selected agent detail
@@ -259,5 +322,66 @@ export const useSimulationStore = create((set, get) => ({
       console.error('Export error:', error);
       alert('Failed to export session data.');
     }
+  },
+
+  resetSimulation: () => {
+    const { playInterval } = get();
+    if (playInterval) clearInterval(playInterval);
+    
+    set({
+      isInitialized: false,
+      isPlaying: false,
+      playInterval: null,
+      currentTick: 0,
+      agents: [],
+      edges: [],
+      activeInfluencers: [],
+      edgesSevered: 0,
+      edgesFormed: 0,
+      selectedAgentId: null,
+      telemetry: {
+        current_tick: 0,
+        polarization: 0,
+        avg_belief: 0,
+        edges_severed: 0,
+        edges_formed: 0,
+        history: []
+      },
+      mutatedNarratives: []
+    });
+  },
+
+  loadSession: (sessionData) => {
+    const { playInterval } = get();
+    if (playInterval) clearInterval(playInterval);
+    
+    if (!sessionData || !sessionData.agents || !sessionData.edges) {
+      alert("Invalid session data. Cannot load.");
+      return;
+    }
+    
+    // Attempt to reconstruct history object
+    const finalPol = sessionData.final_polarization || 0;
+    
+    set({
+      isInitialized: true,
+      isPlaying: false,
+      playInterval: null,
+      currentTick: sessionData.total_ticks || 0,
+      agents: sessionData.agents,
+      edges: sessionData.edges,
+      telemetry: {
+        current_tick: sessionData.total_ticks || 0,
+        polarization: finalPol,
+        avg_belief: 0,
+        edges_severed: 0,
+        edges_formed: 0,
+        history: sessionData.history || []
+      },
+      mutatedNarratives: sessionData.narrative_logs || [],
+      selectedAgentId: null
+    });
+    
+    alert("Session loaded successfully! 3D Canvas updated.");
   }
 }));

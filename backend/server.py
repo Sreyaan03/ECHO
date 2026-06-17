@@ -266,6 +266,12 @@ def export_session():
     
     # We reconstruct the history explicitly from get_telemetry() to get a nice dict format
     telemetry = engine.get_telemetry()
+    
+    # Collect current agent states
+    agents_data = []
+    for i in range(engine.n_agents):
+        agents_data.append(engine.get_agent_detail(i))
+        
     return {
         "success": True,
         "n_agents": engine.n_agents,
@@ -273,6 +279,8 @@ def export_session():
         "history": telemetry.get("history", []),
         "narrative_logs": narrative_logs,
         "final_polarization": telemetry.get("polarization", 0),
+        "agents": agents_data,
+        "edges": get_active_edges(engine.get_graph())
     }
 
 class UpdatePromptsRequest(BaseModel):
