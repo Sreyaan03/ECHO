@@ -1,4 +1,4 @@
-<![CDATA[<div align="center">
+<div align="center">
 
 # ⚡ ECHO — Opinion Dynamics & Echo Chamber Simulator
 
@@ -228,4 +228,3 @@ MIT — free for academic and commercial use.
 **Built with NumPy, NetworkX, FastAPI, React Three Fiber, and a lot of sociological curiosity.**
 
 </div>
-]]>
