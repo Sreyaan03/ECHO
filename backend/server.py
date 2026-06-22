@@ -1,13 +1,18 @@
 import logging
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import tempfile
+import os
 from pydantic import BaseModel
 import networkx as nx
 import numpy as np
+from RestrictedPython import compile_restricted, safe_builtins
 
 from opinion_engine.opinion_engine import OpinionEngine, Topology, TopologyParams
 from opinion_engine.llm_client import EchoLLMClient, DEFAULT_REACTION_TEMPLATE, DEFAULT_INJECTION_TEMPLATE
+from opinion_engine.data_pipeline import OSINTDataPipeline
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +33,30 @@ app.add_middleware(
 engine: Optional[OpinionEngine] = None
 static_positions: Dict[int, Dict[str, float]] = {}
 narrative_logs: List[Dict[str, Any]] = []
+influencer_memory: Dict[int, List[str]] = {}
+influencer_strategy: Dict[int, str] = {}
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        self.is_playing = False
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                pass
+
+manager = ConnectionManager()
 
 # Initialize LLM client
 llm_client = EchoLLMClient()
@@ -36,6 +65,9 @@ class TopologyParamsModel(BaseModel):
     m: int = 3
     k: int = 6
     p: float = 0.3
+    sbm_blocks: int = 3
+    sbm_p_in: float = 0.3
+    sbm_p_out: float = 0.01
 
 class InitializeRequest(BaseModel):
     n_agents: int = 500
@@ -52,11 +84,25 @@ class InitializeRequest(BaseModel):
     topic: Optional[str] = None
     custom_edges: Optional[List[List[int]]] = None
     p_fact_checkers: float = 0.05
+    p_bots: float = 0.0
+    belief_dist: str = "uniform"
 
 class InjectRequest(BaseModel):
     agent_id: int
     belief_score: float
     message: Optional[str] = None
+
+class BroadcastRequest(BaseModel):
+    belief_shift: float
+    arousal_shift: float
+    message: str
+
+class AlgorithmRequest(BaseModel):
+    code_string: str
+
+class WireRequest(BaseModel):
+    source_id: int
+    target_id: int
 
 def get_active_edges(opinion_graph: nx.Graph) -> List[List[int]]:
     """Convert NetworkX graph edges to a simple list of lists."""
@@ -64,15 +110,23 @@ def get_active_edges(opinion_graph: nx.Graph) -> List[List[int]]:
 
 @app.post("/api/initialize")
 def initialize_simulation(req: InitializeRequest):
-    global engine, static_positions, narrative_logs
+    global engine, static_positions, narrative_logs, influencer_memory, influencer_strategy
     try:
-        topo = Topology.SCALE_FREE if req.topology == "scale_free" else Topology.SMALL_WORLD
+        if req.topology == "scale_free":
+            topo = Topology.SCALE_FREE
+        elif req.topology == "stochastic_block":
+            topo = Topology.STOCHASTIC_BLOCK
+        else:
+            topo = Topology.SMALL_WORLD
         
         t_params = TopologyParams()
         if req.topology_params:
             t_params.m = req.topology_params.m
             t_params.k = req.topology_params.k
             t_params.p = req.topology_params.p
+            t_params.sbm_blocks = req.topology_params.sbm_blocks
+            t_params.sbm_p_in = req.topology_params.sbm_p_in
+            t_params.sbm_p_out = req.topology_params.sbm_p_out
 
         engine = OpinionEngine(
             n_agents=req.n_agents,
@@ -87,11 +141,15 @@ def initialize_simulation(req: InitializeRequest):
             seed=req.seed,
             fatigue_limit=req.fatigue_limit,
             p_fact_checkers=req.p_fact_checkers,
+            p_bots=req.p_bots,
             custom_edges=req.custom_edges,
+            belief_dist=req.belief_dist,
         )
 
-        # Clear narrative logs
+        # Clear logs and memory
         narrative_logs = []
+        influencer_memory.clear()
+        influencer_strategy.clear()
         
         # If starting topic is provided, generate Patient Zero post via LLM
         if req.topic:
@@ -128,22 +186,93 @@ def initialize_simulation(req: InitializeRequest):
         logger.info(f"Simulation initialized with {req.n_agents} agents and {req.topology} topology.")
         
         return {
-            "success": True,
+            "message": "Simulation initialized successfully",
             "agents": agents_data,
-            "edges": get_active_edges(engine.get_graph()),
+            "edges": get_active_edges(graph),
             "positions": static_positions,
             "telemetry": engine.get_telemetry(),
             "narrative_logs": narrative_logs
         }
     except Exception as e:
-        logger.exception("Failed to initialize simulation")
+        logger.error(f"Initialization error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/step")
-def step_simulation():
-    global engine, narrative_logs
+@app.post("/api/upload_topology")
+async def upload_topology(
+    file: UploadFile = File(...),
+    w_pol: float = 0.4,
+    w_econ: float = 0.3,
+    w_rel: float = 0.3,
+    d_tolerance: float = 0.5,
+    gamma: float = 0.1,
+    fatigue_limit: int = 5,
+    arousal_decay: float = 0.8,
+    extremism_threshold: float = 0.8,
+    skepticism_threshold: float = 0.6,
+    fatigue_cooldown: float = 0.2
+):
+    global engine, static_positions, narrative_logs, influencer_memory, influencer_strategy
+    try:
+        # Save uploaded file to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        pipeline = OSINTDataPipeline(llm_client=llm_client)
+        agents_matrix, adj_matrix, edges_list, anchors = pipeline.load_topology(tmp_path)
+        os.remove(tmp_path)
+
+        engine = OpinionEngine(
+            n_agents=len(agents_matrix),
+            topology=Topology.CUSTOM,
+            w_pol=w_pol,
+            w_econ=w_econ,
+            w_rel=w_rel,
+            d_tolerance=d_tolerance,
+            gamma=gamma,
+            fatigue_limit=fatigue_limit,
+            arousal_decay=arousal_decay,
+            extremism_threshold=extremism_threshold,
+            skepticism_threshold=skepticism_threshold,
+            fatigue_cooldown=fatigue_cooldown,
+            custom_agents_matrix=agents_matrix,
+            custom_adjacency=adj_matrix,
+            custom_anchors=anchors
+        )
+
+        narrative_logs = []
+        influencer_memory.clear()
+        influencer_strategy.clear()
+
+        graph = engine.get_graph()
+        pos = nx.spring_layout(graph, seed=42)
+        static_positions = {
+            int(node_id): {
+                "x": float(coord[0] * 35.0),
+                "z": float(coord[1] * 35.0)
+            }
+            for node_id, coord in pos.items()
+        }
+
+        agents_data = [engine.get_agent_detail(i) for i in range(engine.n_agents)]
+
+        return {
+            "message": "OSINT topology loaded successfully",
+            "agents": agents_data,
+            "edges": get_active_edges(graph),
+            "positions": static_positions,
+            "telemetry": engine.get_telemetry(),
+            "narrative_logs": narrative_logs
+        }
+    except Exception as e:
+        logger.error(f"OSINT upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def run_simulation_step():
+    global engine, narrative_logs, influencer_memory, influencer_strategy
     if not engine:
-        raise HTTPException(status_code=400, detail="Simulation not initialized. Call /api/initialize first.")
+        raise ValueError("Simulation not initialized.")
+    
     
     try:
         # 1. Run physical dynamics tick
@@ -175,26 +304,48 @@ def step_simulation():
                 baseline_belief = engine.get_agent_baseline_belief(influencer_id)
                 stubbornness = engine.get_agent_stubbornness(influencer_id)
                 
+                # Arousal Entropy Shock: if stuck in loop
+                memory = influencer_memory.get(influencer_id, [])
+                if len(memory) > 3 and len(set(memory[-3:])) == 1:
+                    engine._agents[influencer_id, 5] = 1.0 # Spike arousal (COL_AROUSAL=5)
+                    
+                strategy = influencer_strategy.get(influencer_id, "")
+                
                 try:
                     response = llm_client.evaluate_message(
                         baseline_belief=baseline_belief,
                         current_belief=current_belief,
                         stubbornness=stubbornness,
                         incoming_message_text=incoming["message"],
-                        incoming_message_bias=incoming["bias"]
+                        incoming_message_bias=incoming["bias"],
+                        memory_context=strategy
                     )
                     
                     if response.will_engage:
                         # Update belief in engine
                         engine.inject_narrative(influencer_id, response.new_belief_score)
                         
+                        mutated = response.mutated_message
+                        if influencer_id not in influencer_memory:
+                            influencer_memory[influencer_id] = []
+                        influencer_memory[influencer_id].append(mutated)
+                        
+                        # Compress if > 5
+                        if len(influencer_memory[influencer_id]) > 5:
+                            influencer_strategy[influencer_id] = llm_client.summarize_memory(influencer_memory[influencer_id])
+                            influencer_memory[influencer_id] = influencer_memory[influencer_id][-2:]
+                            
+                        top_inf = result.get("top_influencers", [])
+                        source_ids = [int(x) for x in top_inf[influencer_id]] if top_inf else []
+                        
                         # Log the mutated message
                         narrative_logs.append({
                             "tick": result["tick"],
                             "agent_id": int(influencer_id),
-                            "message": response.mutated_message,
+                            "message": mutated,
                             "bias": response.new_belief_score,
-                            "provider": response.provider.value
+                            "provider": response.provider.value,
+                            "source_agent_ids": source_ids
                         })
                 except Exception as ex:
                     logger.warning(f"Failed to run LLM evaluation for agent {influencer_id}: {ex}")
@@ -219,7 +370,50 @@ def step_simulation():
         }
     except Exception as e:
         logger.exception("Failed to advance simulation step")
+        raise e
+
+@app.post("/api/step")
+def step_simulation():
+    try:
+        return run_simulation_step()
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+async def simulation_loop():
+    while True:
+        if manager.is_playing and engine:
+            try:
+                res = await asyncio.to_thread(run_simulation_step)
+                await manager.broadcast({"type": "step_result", "data": res})
+            except Exception as e:
+                logger.error(f"Simulation loop error: {e}")
+                manager.is_playing = False
+                await manager.broadcast({"type": "error", "message": str(e)})
+        await asyncio.sleep(1)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(simulation_loop())
+
+@app.websocket("/api/ws/simulation")
+async def websocket_simulation(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            action = data.get("action")
+            if action == "play":
+                manager.is_playing = True
+            elif action == "pause":
+                manager.is_playing = False
+            elif action == "step":
+                try:
+                    res = await asyncio.to_thread(run_simulation_step)
+                    await websocket.send_json({"type": "step_result", "data": res})
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 @app.post("/api/inject")
 def inject_narrative(req: InjectRequest):
@@ -249,6 +443,47 @@ def inject_narrative(req: InjectRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception("Failed to inject narrative")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/toggle_algorithm")
+def toggle_algorithm():
+    global engine
+    if not engine:
+        raise HTTPException(status_code=400, detail="Simulation not initialized.")
+    
+    engine.algorithm_active = not engine.algorithm_active
+    return {"algorithm_active": engine.algorithm_active}
+
+@app.post("/api/broadcast")
+def global_broadcast(req: BroadcastRequest):
+    global engine, narrative_logs
+    if not engine:
+        raise HTTPException(status_code=400, detail="Simulation not initialized.")
+    
+    try:
+        engine.global_broadcast(req.belief_shift, req.arousal_shift)
+        
+        narrative_logs.append({
+            "tick": engine.tick,
+            "agent_id": -1,  # -1 implies global system event
+            "message": f"[GLOBAL SHOCK] {req.message}",
+            "bias": req.belief_shift,
+            "provider": "system"
+        })
+        
+        # Collect updated beliefs and arousals to return
+        states = engine.get_agent_states()
+        beliefs = states[:, 3].tolist() # COL_BELIEF
+        arousals = states[:, 5].tolist() # COL_AROUSAL
+        
+        return {
+            "success": True, 
+            "beliefs": beliefs, 
+            "arousals": arousals, 
+            "narrative_logs": narrative_logs
+        }
+    except Exception as e:
+        logger.exception("Failed to execute global broadcast")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/telemetry")
@@ -301,6 +536,48 @@ def update_prompts(req: UpdatePromptsRequest):
     llm_client.reaction_system_prompt_template = req.reaction_template
     llm_client.injection_system_prompt_template = req.injection_template
     return {"success": True}
+
+@app.post("/api/godmode/algorithm")
+def inject_algorithm(req: AlgorithmRequest):
+    global engine
+    if not engine:
+        raise HTTPException(status_code=400, detail="Simulation not initialized.")
+    
+    code = req.code_string.strip()
+    if not code:
+        engine.custom_update_logic = None
+        return {"success": True, "message": "Custom logic cleared. Using default dynamics."}
+    
+    try:
+        # Secure compilation
+        byte_code = compile_restricted(code, '<inline>', 'exec')
+        # Setup safe execution environment
+        loc = {}
+        safe_globals = {'__builtins__': safe_builtins, 'np': np}
+        exec(byte_code, safe_globals, loc)
+        
+        # We expect a function named custom_update
+        if "custom_update" not in loc or not callable(loc["custom_update"]):
+            raise ValueError("Code must define a function named 'custom_update(opinions, adjacency)'")
+            
+        engine.custom_update_logic = loc["custom_update"]
+        return {"success": True, "message": "Custom algorithm successfully injected and active."}
+    except Exception as e:
+        logger.error(f"Failed to inject custom algorithm: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/godmode/wire")
+def wire_edge(req: WireRequest):
+    global engine
+    if not engine:
+        raise HTTPException(status_code=400, detail="Simulation not initialized.")
+    
+    try:
+        engine.force_edge(req.source_id, req.target_id)
+        return {"success": True, "edges": get_active_edges(engine.get_graph())}
+    except Exception as e:
+        logger.error(f"Failed to force edge: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

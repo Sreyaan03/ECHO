@@ -118,28 +118,33 @@ class PromptBuilder:
         stubbornness: float,
         incoming_message_text: str,
         incoming_message_bias: float,
-        custom_template: str = DEFAULT_REACTION_TEMPLATE
+        custom_template: str = DEFAULT_REACTION_TEMPLATE,
+        memory_context: Optional[str] = None
     ) -> tuple[str, str]:
-        """Build the system + user prompt for the Reaction & Mutation task.
-
-        Returns (system_prompt, user_prompt).
-        """
+        """Build the system + user prompt for the Reaction & Mutation task."""
+        
         system_prompt = (
             custom_template.format(
                 baseline_belief=baseline_belief,
                 current_belief=current_belief,
                 stubbornness=stubbornness
-            ) + (
-                "\n\nYou MUST respond in strictly valid JSON format. Do not include "
-                "markdown formatting or the word \"json\". Output ONLY this structure:\n"
-                "{\n"
-                '  "will_engage": true or false,\n'
-                '  "mutated_message": "If will_engage is true, write your '
-                'reaction/rewrite (max 280 characters). If false, leave as empty string.",\n'
-                '  "new_belief_score": float (calculate your new belief based on '
-                "the message, -1.0 to 1.0)\n"
-                "}"
-            )
+            ) 
+        )
+        
+        if memory_context:
+            system_prompt += f"\n\nYour Memory & Strategy: {memory_context}\n"
+            system_prompt += f"CRITICAL PHYSICS ENGINE CONSTRAINT: The physics engine strictly dictates your current belief score is {current_belief:.2f}. You CANNOT contradict this score. If your score is < -0.5, your post MUST be hostile to the rumor. If your score is > 0.5, your post MUST be supportive.\n"
+            
+        system_prompt += (
+            "\n\nYou MUST respond in strictly valid JSON format. Do not include "
+            "markdown formatting or the word \"json\". Output ONLY this structure:\n"
+            "{\n"
+            '  "will_engage": true or false,\n'
+            '  "mutated_message": "If will_engage is true, write your '
+            'reaction/rewrite (max 280 characters). If false, leave as empty string.",\n'
+            '  "new_belief_score": float (calculate your new belief based on '
+            "the message, -1.0 to 1.0)\n"
+            "}"
         )
 
         user_prompt = (
@@ -386,6 +391,7 @@ class EchoLLMClient:
         stubbornness: float,
         incoming_message_text: str,
         incoming_message_bias: float,
+        memory_context: Optional[str] = None,
     ) -> LLMResponse:
         """Evaluate an incoming message and generate a mutation response.
 
@@ -398,7 +404,8 @@ class EchoLLMClient:
             stubbornness=stubbornness,
             incoming_message_text=incoming_message_text,
             incoming_message_bias=incoming_message_bias,
-            custom_template=self.reaction_system_prompt_template
+            custom_template=self.reaction_system_prompt_template,
+            memory_context=memory_context
         )
 
         for provider in self._providers:
@@ -472,6 +479,26 @@ class EchoLLMClient:
             encoded_bias=0.85,
             provider=LLMProvider.MOCK,
         )
+
+    def summarize_memory(self, past_posts: list[str]) -> str:
+        """Compress past posts into a single sentence strategy."""
+        if not past_posts:
+            return ""
+            
+        system_prompt = "You are a psychological analyst. Read these social media posts by a single user and summarize their persuasion strategy in ONE short sentence. Output just the sentence, no quotes."
+        user_prompt = "Posts:\n" + "\n".join([f"- {p}" for p in past_posts])
+        
+        for provider in self._providers:
+            try:
+                if provider == LLMProvider.GROQ:
+                    return self._call_groq_raw(system_prompt, user_prompt).strip()
+                elif provider == LLMProvider.GEMINI:
+                    return self._call_gemini_raw(system_prompt, user_prompt).strip()
+                elif provider == LLMProvider.MOCK:
+                    return "Consistently aggressive and emotional."
+            except Exception:
+                continue
+        return "Consistently aggressive and emotional."
 
     # ------------------------------------------------------------------
     # Provider Implementations

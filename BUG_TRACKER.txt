@@ -1,0 +1,30 @@
+ECHO SIMULATION ENGINE - BUG TRACKER
+====================================
+Last Updated: 2026-06-18 16:07:48 IST
+
+1. [FIXED] Missing Backend Route for Algorithm Feed Toggle
+   - Time Found: 2026-06-18 ~14:45 IST
+   - Description: The "Alg Feed" toggle switch in Dashboard.jsx was failing because the corresponding POST endpoint `/api/toggle_algorithm` was not implemented in `server.py`.
+   - Resolution: Added the endpoint to `server.py` to correctly toggle `engine.algorithm_active`.
+
+2. [FIXED] Doomsday Modal Click Propagation
+   - Time Found: 2026-06-18 ~14:55 IST
+   - Description: Clicking the background overlay of the Doomsday console failed to close the modal because the event wasn't propagating properly, leaving the user stuck in the Doomsday UI.
+   - Resolution: Added an explicit Close (X) button and attached `e.stopPropagation()` and `setShowDoomsday(false)` to the background div onClick handler.
+
+3. [RESOLVED] Doomsday Button Visual Feedback Subtlety
+   - Time Found: 2026-06-18 ~15:05 IST
+   - Description: Pressing the Doomsday button appeared to "do nothing" visually because the default `Belief Shift` slider was at 0.0, meaning nodes didn't change color, only vibrated slightly due to arousal.
+   - Resolution: Confirmed backend was successfully mutating the state matrix. Advised that pushing the slider to 1.0 or -1.0 provides the expected extreme visual feedback. 
+
+4. [FIXED] Anisotropic "X-Shape" Force Physics Bug
+   - Time Found: 2026-06-18 ~16:05 IST
+   - Description: Loading a dense graph (Twitch Gamers dataset, 1895 edges) caused nodes to collapse into a perfect "X" or cross shape instead of an organic cluster.
+   - Root Cause: A performance heuristic (`repulsionSkip`) in `VoxelCanvas.jsx` skipped Coulomb repulsion calculations for 3 out of every 4 nodes. In dense graphs, this lack of radial symmetry caused nodes to fall into the algorithm's blind spots.
+   - Resolution: Removed the `repulsionSkip` optimization. V8 handles the O(N²) interactions for N=500 easily at 60fps. The nodes now form a highly organic, natural hairball shape.
+
+5. [FIXED] Uncaught ReferenceError Causing Green Screen
+   - Time Found: 2026-06-20 ~20:05 IST
+   - Description: The React frontend crashed entirely, leaving only the solid `#688e2e` grass-green CSS background visible. The console showed `Uncaught ReferenceError: showDoomsday is not defined`.
+   - Root Cause: During the injection of the new "God Mode" modal UI into `Dashboard.jsx`, the `showDoomsday` state variable was accidentally deleted from the source code, causing the React component tree to fail parsing during runtime.
+   - Resolution: Restored `const [showDoomsday, setShowDoomsday] = useState(false);` to line 51 of `Dashboard.jsx`. Restarted Vite dev server to clear the cached error state.

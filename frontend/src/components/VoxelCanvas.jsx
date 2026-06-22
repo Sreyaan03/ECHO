@@ -3,6 +3,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, OrthographicCamera } from '@react-three/drei';
 import { EffectComposer, Noise, Pixelation } from '@react-three/postprocessing';
 import * as THREE from 'three';
+import { quadtree } from 'd3-quadtree';
 import { useSimulationStore } from '../store/useSimulationStore';
 
 // Checkerboard grass texture creator
@@ -49,12 +50,12 @@ const COLOR_FACT_CHECKER = new THREE.Color('#FFFFFF'); // Bright White
 // ============================================================================
 // Force-Directed Physics Constants
 // ============================================================================
-const REPULSION_STRENGTH = 80.0;     // Coulomb repulsion constant
-const ATTRACTION_STRENGTH = 0.008;   // Hooke spring constant
-const GRAVITY_STRENGTH = 0.002;      // Central pull toward origin
-const DAMPING = 0.88;                // Velocity friction per frame
-const MAX_VELOCITY = 1.5;            // Velocity clamp to prevent explosion
-const REST_LENGTH = 4.0;             // Natural rest length of springs
+const REPULSION_STRENGTH = 20.0;     // Coulomb repulsion constant (Reduced by 4x to compensate for un-skipping)
+const ATTRACTION_STRENGTH = 0.01;    // Hooke spring constant
+const GRAVITY_STRENGTH = 0.008;      // Central pull toward origin
+const DAMPING = 0.85;                // Velocity friction per frame
+const MAX_VELOCITY = 2.0;            // Velocity clamp to prevent explosion
+const REST_LENGTH = 3.0;             // Natural rest length of springs
 const EPSILON = 0.01;                // Prevent division-by-zero
 
 // ============================================================================
@@ -65,8 +66,8 @@ const EPSILON = 0.01;                // Prevent division-by-zero
 function ForceDirectedSimulation({ livePositionsRef }) {
   const { agents, positions: storePositions, edges } = useSimulationStore();
   
-  // Mutable velocity buffer (never triggers re-render)
   const velocitiesRef = useRef(null);
+  const nodesRef = useRef([]);
   
   // Track the previous positions fingerprint to detect re-initialization
   const prevPositionsFingerprintRef = useRef(null);
@@ -118,33 +119,74 @@ function ForceDirectedSimulation({ livePositionsRef }) {
     const fz = new Float32Array(n);
 
     // ────────────────────────────────────────────────────────────
-    // 1. REPULSION FORCE (Coulomb's Law)
-    //    Use a coarse grid / reduced iteration for large N
+    // 1. REPULSION FORCE (Barnes-Hut Quadtree O(N log N))
     // ────────────────────────────────────────────────────────────
-    // For N > 200, only compute repulsion for a random subset of pairs
-    // to maintain 60fps. This is an O(N²) approximation.
-    const repulsionSkip = n > 300 ? 4 : n > 150 ? 2 : 1;
-    
+    const nodes = nodesRef.current;
+    if (nodes.length !== n) {
+      nodes.length = 0;
+      for (let i = 0; i < n; i++) nodes.push({ x: 0, y: 0, index: i });
+    }
+
     for (let i = 0; i < n; i++) {
-      const px = posArr[i * 2];
-      const pz = posArr[i * 2 + 1];
-      
-      for (let j = i + 1; j < n; j += repulsionSkip) {
-        const dx = px - posArr[j * 2];
-        const dz = pz - posArr[j * 2 + 1];
-        const distSq = dx * dx + dz * dz + EPSILON;
-        const dist = Math.sqrt(distSq);
-        
-        // Coulomb: F = C_rep / dist²  ·  direction
-        const force = REPULSION_STRENGTH / distSq;
-        const forceX = (dx / dist) * force;
-        const forceZ = (dz / dist) * force;
-        
-        fx[i] += forceX;
-        fz[i] += forceZ;
-        fx[j] -= forceX;
-        fz[j] -= forceZ;
+      nodes[i].x = posArr[i * 2];
+      nodes[i].y = posArr[i * 2 + 1];
+    }
+
+    const tree = quadtree()
+      .x(d => d.x)
+      .y(d => d.y)
+      .addAll(nodes);
+
+    tree.visitAfter((quad) => {
+      let weight = 0, x = 0, y = 0;
+      if (quad.length) {
+        for (let i = 0; i < 4; ++i) {
+          const q = quad[i];
+          if (q && q.value) {
+            weight += q.value;
+            x += q.x * q.value;
+            y += q.y * q.value;
+          }
+        }
+        quad.x = x / weight;
+        quad.y = y / weight;
+        quad.value = weight;
+      } else {
+        quad.x = quad.data.x;
+        quad.y = quad.data.y;
+        quad.value = 1;
       }
+    });
+
+    const theta2 = 0.81;
+    for (let i = 0; i < n; i++) {
+      const node = nodes[i];
+      tree.visit((quad, x1, y1, x2, y2) => {
+        if (!quad.value) return true;
+        const dx = quad.x - node.x;
+        const dz = quad.y - node.y;
+        const w = x2 - x1;
+        const l = dx * dx + dz * dz;
+
+        if (w * w / theta2 < l) {
+          const distSq = l + EPSILON;
+          const dist = Math.sqrt(distSq);
+          const force = (REPULSION_STRENGTH * quad.value) / distSq;
+          fx[i] -= (dx / dist) * force;
+          fz[i] -= (dz / dist) * force;
+          return true;
+        } else if (quad.length) {
+          return false;
+        }
+
+        if (quad.data !== node) {
+          const distSq = l + EPSILON;
+          const dist = Math.sqrt(distSq);
+          const force = REPULSION_STRENGTH / distSq;
+          fx[i] -= (dx / dist) * force;
+          fz[i] -= (dz / dist) * force;
+        }
+      });
     }
 
     // ────────────────────────────────────────────────────────────
@@ -434,6 +476,91 @@ function NetworkEdges({ livePositionsRef }) {
 }
 
 // ============================================================================
+// Provenance Streams (Causal Narrative Pulses) Component
+// ============================================================================
+function ProvenanceStreams({ livePositionsRef }) {
+  const { mutatedNarratives } = useSimulationStore();
+  const particlesRef = useRef();
+
+  useFrame((state) => {
+    if (!particlesRef.current || !mutatedNarratives || mutatedNarratives.length === 0) return;
+    const posArr = livePositionsRef.current;
+    if (!posArr) return;
+
+    const time = state.clock.getElapsedTime();
+    const pts = [];
+    const cls = [];
+
+    // Only visualize recent pulses (last 5 ticks)
+    const currentTick = mutatedNarratives[mutatedNarratives.length - 1].tick;
+    const recentLogs = mutatedNarratives.filter(log => currentTick - log.tick < 5);
+
+    recentLogs.forEach(log => {
+      const targetId = log.agent_id;
+      const sourceIds = log.source_agent_ids || [];
+      
+      sourceIds.forEach(sourceId => {
+        if (sourceId * 2 + 1 >= posArr.length || targetId * 2 + 1 >= posArr.length) return;
+
+        const sx = posArr[sourceId * 2];
+        const sz = posArr[sourceId * 2 + 1];
+        const tx = posArr[targetId * 2];
+        const tz = posArr[targetId * 2 + 1];
+
+        // Particle moves from source to target, looping
+        // The speed is slightly offset by sourceId to desync them
+        const progress = (time * 1.5 + sourceId * 0.1) % 1.0;
+        
+        // Easing function to make it jump nicely
+        const easeProgress = Math.pow(progress, 1.5);
+        
+        const px = sx + (tx - sx) * easeProgress;
+        const pz = sz + (tz - sz) * easeProgress;
+        
+        // Arc up
+        const py = 0.5 + Math.sin(easeProgress * Math.PI) * 2.0;
+
+        pts.push(px, py, pz);
+
+        // Color based on provider or default
+        let color = new THREE.Color('#FFD700'); // Default gold
+        if (log.provider === 'groq') color = new THREE.Color('#00FF00');
+        else if (log.provider === 'gemini') color = new THREE.Color('#00FFFF');
+        else if (log.provider === 'manual') color = new THREE.Color('#FF0000');
+
+        cls.push(color.r, color.g, color.b);
+      });
+    });
+
+    const positionArray = new Float32Array(pts);
+    const colorArray = new Float32Array(cls);
+
+    particlesRef.current.geometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(positionArray, 3)
+    );
+    particlesRef.current.geometry.setAttribute(
+      'color',
+      new THREE.BufferAttribute(colorArray, 3)
+    );
+    particlesRef.current.geometry.computeBoundingSphere();
+  });
+
+  return (
+    <points ref={particlesRef}>
+      <bufferGeometry />
+      <pointsMaterial 
+        size={0.6} 
+        vertexColors 
+        transparent 
+        opacity={0.8} 
+        sizeAttenuation={true} 
+      />
+    </points>
+  );
+}
+
+// ============================================================================
 // Floating Indicator Markers for selection and active influencers
 // ============================================================================
 function AgentMarkers({ livePositionsRef }) {
@@ -483,6 +610,30 @@ function AgentMarkers({ livePositionsRef }) {
             color="#FFFFFF" 
             emissive="#FFFFFF" 
             emissiveIntensity={0.8}
+          />
+        </mesh>
+      );
+    }
+  });
+
+  // 0.5 Bot Markers: Floating red/black spikes
+  agents.forEach((agent, i) => {
+    if (agent.is_bot && i !== selectedAgentId) {
+      const height = 1.0 + agent.economic * 6.0;
+      const baseHeight = height + 0.6;
+      markers.push(
+        <mesh 
+          key={`bot-${i}`} 
+          position={[0, baseHeight, 0]}
+          userData={{ agentId: i, baseHeightFactor: baseHeight }}
+        >
+          <cylinderGeometry args={[0, 0.15, 0.6, 4]} />
+          <meshStandardMaterial 
+            color="#8B0000" 
+            emissive="#4B0082" 
+            emissiveIntensity={0.8}
+            roughness={0.2}
+            metalness={0.8}
           />
         </mesh>
       );
@@ -612,6 +763,7 @@ export default function VoxelCanvas() {
             <TerrainFloor />
             <AgentNodes livePositionsRef={livePositionsRef} />
             <NetworkEdges livePositionsRef={livePositionsRef} />
+            <ProvenanceStreams livePositionsRef={livePositionsRef} />
             <AgentMarkers livePositionsRef={livePositionsRef} />
           </>
         )}

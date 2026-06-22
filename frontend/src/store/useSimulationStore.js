@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api';
+const WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
 
 // Web Audio API Synthesizer
 let audioCtx = null;
@@ -69,11 +70,17 @@ export const useSimulationStore = create((set, get) => ({
     topology_params: {
       m: 3,
       k: 8,
-      p: 0.2
-    }
+      p: 0.2,
+      sbm_blocks: 3,
+      sbm_p_in: 0.3,
+      sbm_p_out: 0.01
+    },
+    p_bots: 0.0,
+    belief_dist: 'uniform'
   },
 
   // State
+  algorithmActive: false,
   isInitialized: false,
   isPlaying: false,
   currentTick: 0,
@@ -101,7 +108,8 @@ export const useSimulationStore = create((set, get) => ({
   },
   
   // Animation / Interval reference for auto-playing
-  playInterval: null,
+  socket: null,
+  isInitializing: false,
 
   // Actions
   setConfig: (newConfig) => set((state) => ({ config: { ...state.config, ...newConfig } })),
@@ -110,14 +118,15 @@ export const useSimulationStore = create((set, get) => ({
   selectAgent: (agentId) => set({ selectedAgentId: agentId }),
 
   initializeSimulation: async () => {
-    const { config, playInterval } = get();
+    const { config, socket } = get();
     
-    // Stop any existing intervals
-    if (playInterval) {
-      clearInterval(playInterval);
-      set({ playInterval: null, isPlaying: false });
+    if (socket) {
+      socket.send(JSON.stringify({ action: 'pause' }));
+      socket.close();
+      set({ socket: null, isPlaying: false });
     }
 
+    set({ isInitializing: true });
     initAudio();
 
     try {
@@ -144,62 +153,121 @@ export const useSimulationStore = create((set, get) => ({
         telemetry: data.telemetry,
         mutatedNarratives: data.narrative_logs || []
       });
+      get().connectWebSocket();
     } catch (error) {
       console.error('Initialization error:', error);
       alert('Error initializing simulation. Make sure the Python backend is running on port 8000.');
+    } finally {
+      set({ isInitializing: false });
     }
   },
 
-  stepSimulation: async () => {
-    const { isInitialized } = get();
-    if (!isInitialized) return false;
+  uploadTopology: async (file) => {
+    const { config, socket } = get();
+    
+    if (socket) {
+      socket.send(JSON.stringify({ action: 'pause' }));
+      socket.close();
+      set({ socket: null, isPlaying: false });
+    }
+
+    set({ isInitializing: true });
+
+    initAudio();
 
     try {
-      const response = await fetch(`${API_BASE_URL}/step`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      });
-
-      if (!response.ok) throw new Error('Failed to compute tick');
-
-      const data = await response.json();
-
-      // Update the agents array with new beliefs and arousals
-      const updatedAgents = get().agents.map((agent, index) => ({
-        ...agent,
-        belief: data.beliefs[index],
-        arousal: data.arousals[index]
-      }));
-
-      // Fetch fresh telemetry from server
-      const telRes = await fetch(`${API_BASE_URL}/telemetry`);
-      const telemetryData = telRes.ok ? await telRes.json() : get().telemetry;
-
-      // Audio Feedback
-      playSound('tick');
-      const newlySevered = data.edges_severed - get().edgesSevered;
-      if (newlySevered > 0) {
-        playSound('sever', { count: newlySevered });
+      const formData = new FormData();
+      formData.append('file', file);
+      
+      // Append config params
+      for (const [key, value] of Object.entries(config)) {
+        if (typeof value === 'number' || typeof value === 'string') {
+          formData.append(key, value);
+        }
       }
 
+      const response = await fetch(`${API_BASE_URL}/upload_topology`, {
+        method: 'POST',
+        body: formData
+      });
+      
+      if (!response.ok) throw new Error('Failed to upload OSINT topology');
+      
+      const data = await response.json();
+      
       set({
-        currentTick: data.tick,
-        agents: updatedAgents,
+        isInitialized: true,
+        currentTick: 0,
+        agents: data.agents,
         edges: data.edges,
-        edgesSevered: data.edges_severed,
-        edgesFormed: data.edges_formed,
-        activeInfluencers: data.active_influencers,
-        telemetry: telemetryData,
+        positions: data.positions,
+        activeInfluencers: [],
+        edgesSevered: 0,
+        edgesFormed: 0,
+        selectedAgentId: null,
+        telemetry: data.telemetry,
         mutatedNarratives: data.narrative_logs || []
       });
-
-      // Return true if simulation is still moving (optional check)
-      return true;
+      get().connectWebSocket();
     } catch (error) {
-      console.error('Step error:', error);
-      get().pauseSimulation();
-      return false;
+      console.error('Upload error:', error);
+      alert('Error uploading topology. Check backend connection and file format.');
+    } finally {
+      set({ isInitializing: false });
     }
+  },
+
+  connectWebSocket: () => {
+    const ws = new WebSocket(`${WS_BASE_URL}/ws/simulation`);
+    ws.onmessage = async (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'step_result') {
+        const data = msg.data;
+        
+        // Update the agents array with new beliefs and arousals
+        const updatedAgents = get().agents.map((agent, index) => ({
+          ...agent,
+          belief: data.beliefs[index],
+          arousal: data.arousals[index]
+        }));
+
+        // Fetch fresh telemetry from server
+        // To avoid spamming, we could let the WS send telemetry, but for now we fetch it if not provided.
+        // Let's fetch since we know the telemetry endpoint exists.
+        const telRes = await fetch(`${API_BASE_URL}/telemetry`);
+        const telemetryData = telRes.ok ? await telRes.json() : get().telemetry;
+
+        // Audio Feedback
+        playSound('tick');
+        const newlySevered = data.edges_severed - get().edgesSevered;
+        if (newlySevered > 0) {
+          playSound('sever', { count: newlySevered });
+        }
+
+        set({
+          currentTick: data.tick,
+          agents: updatedAgents,
+          edges: data.edges,
+          edgesSevered: data.edges_severed,
+          edgesFormed: data.edges_formed,
+          activeInfluencers: data.active_influencers,
+          telemetry: telemetryData,
+          mutatedNarratives: data.narrative_logs || []
+        });
+      } else if (msg.type === 'error') {
+        console.error('WebSocket Error:', msg.message);
+        get().pauseSimulation();
+      }
+    };
+    ws.onclose = () => set({ isPlaying: false, socket: null });
+    set({ socket: ws });
+  },
+
+  stepSimulation: async () => {
+    const { isInitialized, socket } = get();
+    if (!isInitialized || !socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ action: 'step' }));
+    return true;
   },
 
   injectNarrative: async (agentId, beliefScore, message) => {
@@ -236,23 +304,85 @@ export const useSimulationStore = create((set, get) => ({
     }
   },
 
+  globalBroadcast: async (beliefShift, arousalShift, message) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/broadcast`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ belief_shift: beliefShift, arousal_shift: arousalShift, message: message })
+      });
+
+      if (!response.ok) throw new Error('Failed to broadcast global shock');
+
+      const data = await response.json();
+      
+      // Update local agents array
+      const updatedAgents = get().agents.map((agent, index) => ({
+        ...agent,
+        belief: data.beliefs[index],
+        arousal: data.arousals[index]
+      }));
+
+      set({ 
+        agents: updatedAgents,
+        mutatedNarratives: data.narrative_logs || []
+      });
+      
+      initAudio();
+      playSound('inject'); // Maybe add a new sound effect here later, for now reuse inject
+      
+    } catch (error) {
+      console.error('Broadcast error:', error);
+    }
+  },
+
+  injectAlgorithm: async (codeString) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/godmode/algorithm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code_string: codeString })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Failed to inject custom algorithm');
+      alert(data.message);
+    } catch (error) {
+      console.error('Algorithm injection error:', error);
+      alert('Error: ' + error.message);
+    }
+  },
+
+  wireEdge: async (sourceId, targetId) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/godmode/wire`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_id: parseInt(sourceId), target_id: parseInt(targetId) })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Failed to wire edge');
+      set({ edges: data.edges });
+      alert("Edge forced successfully.");
+    } catch (error) {
+      console.error('Wire edge error:', error);
+      alert('Error: ' + error.message);
+    }
+  },
+
   startSimulationLoop: () => {
-    const { isPlaying, playInterval } = get();
-    if (isPlaying || playInterval) return;
+    const { isPlaying, socket } = get();
+    if (isPlaying || !socket || socket.readyState !== WebSocket.OPEN) return;
 
-    const interval = setInterval(async () => {
-      await get().stepSimulation();
-    }, 1000); // Step every 1 second
-
-    set({ isPlaying: true, playInterval: interval });
+    socket.send(JSON.stringify({ action: 'play' }));
+    set({ isPlaying: true });
   },
 
   pauseSimulation: () => {
-    const { playInterval } = get();
-    if (playInterval) {
-      clearInterval(playInterval);
+    const { socket } = get();
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ action: 'pause' }));
     }
-    set({ isPlaying: false, playInterval: null });
+    set({ isPlaying: false });
   },
 
   togglePlay: () => {
@@ -261,6 +391,18 @@ export const useSimulationStore = create((set, get) => ({
       get().pauseSimulation();
     } else {
       get().startSimulationLoop();
+    }
+  },
+
+  toggleAlgorithm: async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/toggle_algorithm`, { method: 'POST' });
+      if (response.ok) {
+        const data = await response.json();
+        set({ algorithmActive: data.algorithm_active });
+      }
+    } catch (error) {
+      console.error('Failed to toggle algorithm:', error);
     }
   },
 
@@ -325,13 +467,17 @@ export const useSimulationStore = create((set, get) => ({
   },
 
   resetSimulation: () => {
-    const { playInterval } = get();
-    if (playInterval) clearInterval(playInterval);
+    const { socket } = get();
+    if (socket) {
+      socket.send(JSON.stringify({ action: 'pause' }));
+      socket.close();
+    }
     
     set({
       isInitialized: false,
       isPlaying: false,
-      playInterval: null,
+      socket: null,
+      algorithmActive: false,
       currentTick: 0,
       agents: [],
       edges: [],
@@ -352,8 +498,11 @@ export const useSimulationStore = create((set, get) => ({
   },
 
   loadSession: (sessionData) => {
-    const { playInterval } = get();
-    if (playInterval) clearInterval(playInterval);
+    const { socket } = get();
+    if (socket) {
+      socket.send(JSON.stringify({ action: 'pause' }));
+      socket.close();
+    }
     
     if (!sessionData || !sessionData.agents || !sessionData.edges) {
       alert("Invalid session data. Cannot load.");
