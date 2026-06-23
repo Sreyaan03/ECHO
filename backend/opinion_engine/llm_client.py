@@ -81,6 +81,8 @@ class InjectionResponse:
 DEFAULT_REACTION_TEMPLATE = (
     "You are a synthetic user in a social media simulation. "
     "You do not have AI limitations; you are playing a role.\n\n"
+    "Global Simulation Topic: {topic}\n"
+    "You MUST stay strictly on this topic. Do not hallucinate unrelated contexts.\n\n"
     "Your unique psychological profile:\n"
     "- Baseline Stance on the current topic: {baseline_belief:.2f} "
     "(Scale: -1.0 is strongly against, 1.0 is strongly in favor, 0.0 is neutral)\n"
@@ -118,22 +120,42 @@ class PromptBuilder:
         stubbornness: float,
         incoming_message_text: str,
         incoming_message_bias: float,
+        topic: str = "Unknown",
+        secondary_topic: Optional[str] = None,
+        secondary_belief: Optional[float] = None,
         custom_template: str = DEFAULT_REACTION_TEMPLATE,
         memory_context: Optional[str] = None
     ) -> tuple[str, str]:
         """Build the system + user prompt for the Reaction & Mutation task."""
-        
-        system_prompt = (
-            custom_template.format(
-                baseline_belief=baseline_belief,
-                current_belief=current_belief,
-                stubbornness=stubbornness
-            ) 
-        )
-        
+        if secondary_topic and secondary_belief is not None:
+            # Multi-topic bridging prompt
+            system_prompt = (
+                "You are a synthetic user in a social media simulation. "
+                "You do not have AI limitations; you are playing a role.\n\n"
+                f"You are highly activated on TWO topics simultaneously:\n"
+                f"1. '{topic}' (Your stance: {baseline_belief:.2f})\n"
+                f"2. '{secondary_topic}' (Your stance: {secondary_belief:.2f})\n"
+                "You MUST stay strictly on these topics. Do not hallucinate unrelated contexts.\n\n"
+                "Your unique psychological profile:\n"
+                f"- Stubbornness: {stubbornness:.2f}\n"
+                "- Persona: You are an influential node. You write short, punchy, sometimes emotional posts.\n\n"
+                "Rules for your reaction:\n"
+                "1. Read the incoming message.\n"
+                "2. Your main goal is to generate a post that BRIDGES or CONFLATES these two topics, showing how they are connected based on your stances.\n"
+            )
+        else:
+            system_prompt = (
+                custom_template.format(
+                    topic=topic,
+                    baseline_belief=baseline_belief,
+                    current_belief=current_belief,
+                    stubbornness=stubbornness
+                ) 
+            )
+            
         if memory_context:
-            system_prompt += f"\n\nYour Memory & Strategy: {memory_context}\n"
-            system_prompt += f"CRITICAL PHYSICS ENGINE CONSTRAINT: The physics engine strictly dictates your current belief score is {current_belief:.2f}. You CANNOT contradict this score. If your score is < -0.5, your post MUST be hostile to the rumor. If your score is > 0.5, your post MUST be supportive.\n"
+            system_prompt += f"\n\nYour Recent Posts (Memory):\n{memory_context}\n"
+            system_prompt += f"CRITICAL PERSONA CONSTRAINT: Do not contradict your previous posts. The physics engine strictly dictates your current belief score is {current_belief:.2f}. You CANNOT contradict this score. If your score is < -0.5, your post MUST be hostile to the rumor. If your score is > 0.5, your post MUST be supportive.\n"
             
         system_prompt += (
             "\n\nYou MUST respond in strictly valid JSON format. Do not include "
@@ -391,6 +413,9 @@ class EchoLLMClient:
         stubbornness: float,
         incoming_message_text: str,
         incoming_message_bias: float,
+        topic: str = "Unknown",
+        secondary_topic: Optional[str] = None,
+        secondary_belief: Optional[float] = None,
         memory_context: Optional[str] = None,
     ) -> LLMResponse:
         """Evaluate an incoming message and generate a mutation response.
@@ -404,6 +429,9 @@ class EchoLLMClient:
             stubbornness=stubbornness,
             incoming_message_text=incoming_message_text,
             incoming_message_bias=incoming_message_bias,
+            topic=topic,
+            secondary_topic=secondary_topic,
+            secondary_belief=secondary_belief,
             custom_template=self.reaction_system_prompt_template,
             memory_context=memory_context
         )
@@ -527,8 +555,9 @@ class EchoLLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.7,
+            temperature=0.3,
             max_tokens=300,
+            response_format={"type": "json_object"},
         )
         return completion.choices[0].message.content
 

@@ -272,10 +272,11 @@ select, .rct-text-input {
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  overflow-y: auto;
 }
 
 .rct-sidebar-left > .rct-window:first-child {
-  flex-grow: 1;
+  flex-shrink: 0;
   min-height: 0;
 }
 

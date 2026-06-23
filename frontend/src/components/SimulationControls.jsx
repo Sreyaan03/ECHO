@@ -1,11 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useSimulationStore } from '../store/useSimulationStore';
 import { Settings, RefreshCw, Upload, Activity, Play, Pause, SkipForward, RotateCcw, Zap, Download } from 'lucide-react';
+import ExportPanel from './ExportPanel';
+import ReligionPanel from './ReligionPanel';
+import TopicsPanel from './TopicsPanel';
 
 export default function SimulationControls() {
   const {
     config, setConfig, isInitialized, isPlaying, currentTick,
     narrativeInput, setNarrativeInput,
+    secondaryTopicInput, setSecondaryTopicInput,
     initializeSimulation, stepSimulation, togglePlay, resetSimulation,
     algorithmActive, toggleAlgorithm, exportSession, uploadTopology, loadSession,
     reactionTemplate, injectionTemplate, defaultReactionTemplate, defaultInjectionTemplate,
@@ -44,7 +48,7 @@ export default function SimulationControls() {
 
   return (
     <section className="rct-sidebar-left">
-      <div className="rct-window">
+      <div className="rct-window" style={{ minHeight: '420px' }}>
         <div className="rct-titlebar">
           <Settings className="title-icon" />
           <span>Simulation Controls</span>
@@ -205,7 +209,7 @@ export default function SimulationControls() {
           {activeTab === 'prompts' && (
             <div className="form-group-list" style={{ flexGrow: 1, display: 'flex', flexDirection: 'column', gap: '8px', minHeight: 0 }}>
               <div style={{ fontSize: '10px', color: '#555', borderBottom: '1px dotted #999', paddingBottom: '6px', lineHeight: '1.3' }}>
-                <strong>Placeholders:</strong> <code>{"{baseline_belief}"}</code>, <code>{"{current_belief}"}</code>, <code>{"{stubbornness}"}</code>. JSON rules are appended automatically.
+                <strong>Placeholders:</strong> <code>{"{topic}"}</code>, <code>{"{secondary_topic}"}</code>, <code>{"{baseline_belief}"}</code>, <code>{"{current_belief}"}</code>. JSON rules are appended automatically.
               </div>
               
               <div className="form-group" style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
@@ -234,8 +238,13 @@ export default function SimulationControls() {
           )}
 
           <div className="form-group" style={{ marginTop: '12px', marginBottom: '8px' }}>
-            <label style={{ fontWeight: 'bold', fontSize: '11px' }}>Global Simulation Topic / Seed:</label>
+            <label style={{ fontWeight: 'bold', fontSize: '11px' }}>Primary Topic / Seed:</label>
             <input type="text" value={narrativeInput} onChange={(e) => setNarrativeInput(e.target.value)} className="rct-text-input" style={{ width: '100%', marginTop: '3px', height: '24px' }} />
+          </div>
+          
+          <div className="form-group" style={{ marginBottom: '8px' }}>
+            <label style={{ fontWeight: 'bold', fontSize: '11px' }}>Secondary Topic (Optional):</label>
+            <input type="text" value={secondaryTopicInput || ''} onChange={(e) => setSecondaryTopicInput(e.target.value)} className="rct-text-input" style={{ width: '100%', marginTop: '3px', height: '24px' }} placeholder="Leave blank for single topic" />
           </div>
 
           <div style={{ display: 'flex', gap: '8px', flexDirection: 'column' }}>
@@ -294,6 +303,10 @@ export default function SimulationControls() {
           </div>
         </div>
       </div>
+
+      <ReligionPanel />
+      <TopicsPanel />
+      <ExportPanel />
     </section>
   );
 }

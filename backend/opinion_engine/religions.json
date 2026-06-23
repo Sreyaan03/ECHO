@@ -1,0 +1,56 @@
+{
+  "version": "1.1",
+  "region": "India",
+  "religions": [
+    {
+      "id": 0,
+      "name": "Hindu",
+      "demographic_weight": 0.798,
+      "dogma_vector": [0.1, 0.7, 0.8, 0.3, 0.9],
+      "authority_multiplier": 4.0,
+      "base_gullibility_range": [0.05, 0.35]
+    },
+    {
+      "id": 1,
+      "name": "Muslim",
+      "demographic_weight": 0.142,
+      "dogma_vector": [0.1, 0.9, 0.9, 0.8, 0.8],
+      "authority_multiplier": 5.0,
+      "base_gullibility_range": [0.05, 0.3]
+    },
+    {
+      "id": 2,
+      "name": "Christian",
+      "demographic_weight": 0.023,
+      "dogma_vector": [0.1, 0.2, 0.8, 0.7, 0.6],
+      "authority_multiplier": 3.5,
+      "base_gullibility_range": [0.08, 0.4]
+    },
+    {
+      "id": 3,
+      "name": "Atheist",
+      "demographic_weight": 0.037,
+      "demographic_weight_note": "~3.7% non-religious/secular population (India census + Gallup 2023)",
+      "dogma_vector": [0.05, 0.0, 0.0, 0.2, 0.0],
+      "dogma_vector_note": "Near-zero dogma across all religious topics. Slight sensitivity on Minority Rights (0.2) reflecting secular rights awareness.",
+      "authority_multiplier": 1.0,
+      "authority_multiplier_note": "No religious authority figure. Peer interactions carry equal weight.",
+      "base_gullibility_range": [0.1, 0.45],
+      "base_gullibility_note": "Slightly higher openness to persuasion reflecting lower ideological rigidity on religious topics."
+    }
+  ],
+  "topic_categories": [
+    "Secular / Political",
+    "Dietary Laws",
+    "Conversion / Apostasy",
+    "Minority Rights",
+    "Sacred Symbols / Worship"
+  ],
+  "friction_matrix": [
+    [0.00, 0.60, 0.20, 0.10],
+    [0.60, 0.00, 0.30, 0.15],
+    [0.20, 0.30, 0.00, 0.05],
+    [0.10, 0.15, 0.05, 0.00]
+  ],
+  "friction_matrix_note": "4x4 matrix indexed by religion id (0=Hindu, 1=Muslim, 2=Christian, 3=Atheist). Atheist row has the lowest friction with all groups — they are the least tribally reactive in religious disputes."
+}

@@ -35,6 +35,7 @@ COL_GULLIBILITY = 4  # μ_i ∈ [0.01, 0.4] (Individual Learning Rate)
 COL_AROUSAL = 5      # A_i ∈ [ 0.0, 1.0] (Dynamic Emotional State)
 COL_LITERACY = 6     # S_i ∈ [ 0.0, 1.0] (Skepticism/Media Literacy)
 COL_IS_BOT = 7       # B_i ∈ {0.0, 1.0}  (Bot status)
+COL_IS_CLERIC = 8    # C_i ∈ {0.0, 1.0}  (Religious Authority Anchor)
 
 INFLUENCER_PERCENTILE = 0.15  # Top 15% by belief delta magnitude
 FATIGUE_LIMIT = 10            # Consecutive backfires before unfollowing
@@ -60,6 +61,8 @@ class TopologyParams:
     sbm_p_out: float = 0.01  # SBM: Out-block edge probability
 
 
+MAX_HISTORY_TICKS = 1000  # Memory cap: ~16MB at 1000 agents × 1000 ticks
+
 @dataclass
 class TickTelemetry:
     """Telemetry snapshot for a single simulation tick."""
@@ -69,6 +72,9 @@ class TickTelemetry:
     edges_severed: int         # Cumulative total of unfollows/blocks
     edges_formed: int          # Cumulative total of new homophilic connections formed
     active_influencers: list[int] = field(default_factory=list)
+    belief_snapshot: list[float] = field(default_factory=list)   # Full per-agent belief distribution
+    arousal_snapshot: list[float] = field(default_factory=list)  # Full per-agent arousal distribution
+    edge_count: int = 0                                           # Live edge count this tick
 
 
 class OpinionEngine:
@@ -101,7 +107,6 @@ class OpinionEngine:
     n_religious_groups : int
         Number of distinct religious/cultural groups.
     seed : int, optional
-        Random seed for reproducibility.
     """
 
     def __init__(
@@ -128,6 +133,8 @@ class OpinionEngine:
         custom_agents_matrix: Optional[np.ndarray] = None,
         custom_adjacency: Optional[np.ndarray] = None,
         custom_anchors: Optional[list[int]] = None,
+        religion_registry: Optional[Any] = None,
+        narrative_profile: Optional[Any] = None,
     ) -> None:
         # Configuration
         self.n_agents = n_agents if custom_agents_matrix is None else custom_agents_matrix.shape[0]
@@ -150,6 +157,9 @@ class OpinionEngine:
         self.fatigue_cooldown = fatigue_cooldown
         self.belief_dist = belief_dist
         
+        self.religion_registry = religion_registry
+        self.narrative_profile = narrative_profile
+
         # Engine State
         self.algorithm_active = False
         self.custom_update_logic: Optional[callable] = None
@@ -192,13 +202,21 @@ class OpinionEngine:
     # ------------------------------------------------------------------
 
     def _init_agents(self) -> np.ndarray:
-        """Create the N×8 agent attribute matrix with random distributions."""
-        agents = np.empty((self.n_agents, 8), dtype=np.float64)
+        """Create the N×9 agent attribute matrix with random distributions."""
+        agents = np.empty((self.n_agents, 9), dtype=np.float64)
 
         # Sociological Anchors
         agents[:, COL_POLITICAL] = self._rng.uniform(-1.0, 1.0, self.n_agents)
         agents[:, COL_ECONOMIC] = self._rng.uniform(0.0, 1.0, self.n_agents)
-        agents[:, COL_RELIGION] = self._rng.integers(1, self.n_religious_groups + 1, self.n_agents).astype(np.float64)
+        
+        if self.religion_registry:
+            agents[:, COL_RELIGION] = self._rng.choice(
+                self.religion_registry.n_religions,
+                size=self.n_agents,
+                p=self.religion_registry.demographic_weights
+            ).astype(np.float64)
+        else:
+            agents[:, COL_RELIGION] = self._rng.integers(1, self.n_religious_groups + 1, self.n_agents).astype(np.float64)
         
         # Dynamic State
         if self.belief_dist == "normal":
@@ -214,11 +232,34 @@ class OpinionEngine:
         
         # Psychological Traits
         agents[:, COL_GULLIBILITY] = self._rng.uniform(0.01, 0.4, self.n_agents)
-        agents[:, COL_AROUSAL] = np.zeros(self.n_agents)  # Network starts calm
+        
+        if self.religion_registry:
+            for r_id in range(self.religion_registry.n_religions):
+                mask = agents[:, COL_RELIGION] == r_id
+                r_range = self.religion_registry.profiles[r_id].base_gullibility_range
+                agents[mask, COL_GULLIBILITY] = self._rng.uniform(r_range[0], r_range[1], mask.sum())
+
+        agents[:, COL_AROUSAL] = 0.0
+        if self.narrative_profile and self.religion_registry:
+            for r_id, name in enumerate(self.religion_registry.names):
+                mask = agents[:, COL_RELIGION] == r_id
+                sens = self.narrative_profile.group_sensitivity.get(name, 0.3)
+                agents[mask, COL_AROUSAL] = sens * self.narrative_profile.initial_arousal_spike
+                
         agents[:, COL_LITERACY] = self._rng.uniform(0.0, 1.0, self.n_agents)
 
-        # Default all to not bot
+        # Default all to not bot and not cleric
         agents[:, COL_IS_BOT] = 0.0
+        agents[:, COL_IS_CLERIC] = 0.0
+        
+        # Assign Clerics
+        if self.religion_registry:
+            for r_id in range(self.religion_registry.n_religions):
+                candidates = np.where(agents[:, COL_RELIGION] == r_id)[0]
+                if len(candidates) > 0:
+                    cleric_id = self._rng.choice(candidates)
+                    agents[cleric_id, COL_IS_CLERIC] = 1.0
+                    agents[cleric_id, COL_GULLIBILITY] = 0.0
 
         # Apply Fact-Checkers
         n_fact_checkers = int(self.n_agents * self.p_fact_checkers)
@@ -231,16 +272,11 @@ class OpinionEngine:
         # Apply Bots
         n_bots = int(self.n_agents * self.p_bots)
         if n_bots > 0:
-            # Choose from agents that are not fact checkers to avoid overlap
             non_fc_indices = np.setdiff1d(np.arange(self.n_agents), fc_indices if n_fact_checkers > 0 else [])
             bot_indices = self._rng.choice(non_fc_indices, min(n_bots, len(non_fc_indices)), replace=False)
-            
-            # Set bot structural identity
             agents[bot_indices, COL_IS_BOT] = 1.0
             agents[bot_indices, COL_LITERACY] = 0.0
-            agents[bot_indices, COL_GULLIBILITY] = 0.0 # 100% stubborn
-            
-            # Split beliefs +1.0 and -1.0 evenly
+            agents[bot_indices, COL_GULLIBILITY] = 0.0 
             half_bots = len(bot_indices) // 2
             agents[bot_indices[:half_bots], COL_BELIEF] = 1.0
             agents[bot_indices[half_bots:], COL_BELIEF] = -1.0
@@ -286,23 +322,33 @@ class OpinionEngine:
         econ_dist = np.abs(E[:, None] - E[None, :])
         rel_match = (R[:, None] == R[None, :]).astype(np.float64)
 
-        return (self.w_pol * pol_dist + self.w_econ * econ_dist - self.w_rel * rel_match)
+        base_dist = self.w_pol * pol_dist + self.w_econ * econ_dist - self.w_rel * rel_match
+        
+        if self.religion_registry:
+            friction = self.religion_registry.friction_matrix[R[:, None], R[None, :]]
+            return base_dist + friction
+        else:
+            return base_dist
+
+    def get_social_distance_matrix(self) -> np.ndarray:
+        """
+        Calculates and returns the social distance matrix D between all agents
+        based on their political, economic, and religious profiles.
+        """
+        return self._compute_social_distance_matrix()
 
     # ------------------------------------------------------------------
     # Core Physics Loop
     # ------------------------------------------------------------------
 
     def step(self) -> dict[str, Any]:
-        """Advance the simulation by one tick and process 7D dynamics."""
+        """Advance the simulation by one tick and process 9D dynamics."""
         self._tick += 1
-        
-        # Arousal naturally decays based on configuration
         self._agents[:, COL_AROUSAL] *= self.arousal_decay
         
         old_beliefs = self._agents[:, COL_BELIEF].copy()
-        D = self._compute_social_distance_matrix()
+        D = self.get_social_distance_matrix()
 
-        # Compute all interactions and get new beliefs
         if self.custom_update_logic is not None:
             try:
                 new_beliefs, top_influencers = self.custom_update_logic(old_beliefs.copy(), self._adjacency.copy())
@@ -312,14 +358,13 @@ class OpinionEngine:
         else:
             new_beliefs, top_influencers = self._apply_opinion_dynamics(D, old_beliefs)
 
-        # Commit updates
         self._agents[:, COL_BELIEF] = new_beliefs
         self._last_belief_delta = np.abs(new_beliefs - old_beliefs)
 
-        # Telemetry aggregation
         polarization = float(np.std(new_beliefs))
         avg_belief = float(np.mean(new_beliefs))
         active_influencers = self.get_active_influencers().tolist()
+        live_edge_count = int(self._adjacency.sum() / 2)
 
         telemetry = TickTelemetry(
             tick=self._tick,
@@ -328,7 +373,13 @@ class OpinionEngine:
             edges_severed=self._total_edges_severed,
             edges_formed=self._total_edges_formed,
             active_influencers=active_influencers,
+            belief_snapshot=new_beliefs.tolist(),
+            arousal_snapshot=self._agents[:, COL_AROUSAL].tolist(),
+            edge_count=live_edge_count,
         )
+
+        if len(self._history) >= MAX_HISTORY_TICKS:
+            self._history.pop(0)
         self._history.append(telemetry)
 
         return {
@@ -344,31 +395,43 @@ class OpinionEngine:
     def _apply_opinion_dynamics(self, D: np.ndarray, beliefs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Apply Convergence, Backfire, Literacy limits, and Structural Fatigue."""
         adj = self._adjacency
-        
         gullibility = self._agents[:, COL_GULLIBILITY] 
         arousal = self._agents[:, COL_AROUSAL]         
         base_literacy = self._agents[:, COL_LITERACY]       
 
-        # Confirmation Bias Mechanic:
-        # Extremism reduces media literacy and narrows tolerance further
         extremism = np.abs(beliefs)
         literacy = base_literacy * (1.0 - extremism)
         
-        # High arousal and high extremism shrink tolerance bounds drastically
         eff_tolerance = self.d_tolerance * (1.0 - arousal) * (1.0 - extremism * 0.5)
-        eff_tolerance_matrix = eff_tolerance[:, None]      
-
+        
+        if self.religion_registry and self.narrative_profile:
+            r_ids = self._agents[:, COL_RELIGION].astype(int)
+            dogma_scores = self.religion_registry.dogma_matrix[r_ids, self.narrative_profile.topic_index]
+            eff_tolerance *= (1.0 - dogma_scores)
+            
+        eff_tolerance_matrix = np.maximum(0.01, eff_tolerance[:, None])
         belief_diff = beliefs[None, :] - beliefs[:, None]
 
-        # ---- State A: Bounded Convergence ----
         extreme_post = np.abs(beliefs[None, :]) > self.extremism_threshold
         skeptic_mask = (literacy[:, None] > self.skepticism_threshold) & extreme_post
         
         converge_mask = (adj > 0) & (D <= eff_tolerance_matrix) & ~skeptic_mask
-        converge_delta = gullibility[:, None] * (1.0 - D) * belief_diff
+        
+        # Incorporate Cleric Authority Multipliers
+        authority_mult = np.ones_like(adj)
+        if self.religion_registry:
+            cleric_mask = self._agents[:, COL_IS_CLERIC] == 1.0
+            for i in range(self.n_agents):
+                if cleric_mask[i]:
+                    r_i = int(self._agents[i, COL_RELIGION])
+                    # Boost for own religion, penalty for others
+                    same_rel = self._agents[:, COL_RELIGION] == r_i
+                    authority_mult[i, same_rel] = self.religion_registry.authority_multipliers[r_i]
+                    authority_mult[i, ~same_rel] = -1.0
+        
+        converge_delta = gullibility[:, None] * (1.0 - D) * belief_diff * authority_mult
         converge_delta *= converge_mask
 
-        # ---- State B: Backfire Repulsion ----
         sign_i = np.sign(beliefs)[:, None]
         sign_j = np.sign(beliefs)[None, :]
         sign_mismatch = sign_i != sign_j
@@ -377,34 +440,23 @@ class OpinionEngine:
         backfire_delta = -self.gamma * D * np.sign(belief_diff)
         backfire_delta *= backfire_mask
 
-        # ---- Dynamic State Updates (Psychology & Structure) ----
-        # 1. Arousal Spikes: Each backfire interaction adds 0.1 to arousal
         backfire_counts = backfire_mask.sum(axis=1)
         self._agents[:, COL_AROUSAL] = np.clip(arousal + (backfire_counts * 0.1), 0.0, 1.0)
 
-        # 2. Connection Fatigue: Track consecutive negative interactions
         self._fatigue[backfire_mask] += 1
-        self._fatigue[converge_mask] = 0  # Reset on positive interaction
-
-        # Decay fatigue across the board for cooling down (Network Healing phase 1)
+        self._fatigue[converge_mask] = 0
         self._fatigue = np.maximum(0.0, self._fatigue - self.fatigue_cooldown)
 
-        # 3. Unfollowing Logic: Sever edges that breach fatigue limit
         sever_mask = self._fatigue >= self.fatigue_limit
         if np.any(sever_mask):
             severed_count = np.sum(adj[sever_mask] > 0)
             self._total_edges_severed += int(severed_count)
-            
-            # Zero out adjacency bidirectionally and mark as severed
             self._adjacency[sever_mask] = 0
             self._adjacency[sever_mask.T] = 0 
             self._severed_edges[sever_mask] = True
             self._severed_edges[sever_mask.T] = True
-            # We don't reset fatigue to 0 immediately so it has to cool down before healing
 
-        # Network Healing phase 2: If fatigue has cooled down to 0 and edge was severed, probabilistically reform
         heal_mask = self._severed_edges & (self._fatigue == 0.0) & (adj == 0)
-        # Small probability of healing per tick if cooled down
         heal_prob_mask = self._rng.random((self.n_agents, self.n_agents)) < 0.05
         active_heals = heal_mask & heal_prob_mask
         active_heals = active_heals | active_heals.T
@@ -414,49 +466,37 @@ class OpinionEngine:
             self._adjacency[active_heals] = 1.0
             self._severed_edges[active_heals] = False
 
-        # 4. Edge Formation (Homophily): Unconnected nodes with similar beliefs randomly discover each other
         unconnected_mask = (adj == 0) & (np.eye(self.n_agents) == 0)
         homophily_mask = unconnected_mask & (np.abs(belief_diff) < 0.1)
-        
-        # Base probability is 0.1%. If Algorithm is active, probability jumps to 5%
         form_prob = 0.05 if self.algorithm_active else 0.001
         form_prob_mask = self._rng.random((self.n_agents, self.n_agents)) < form_prob
         new_edges_mask = homophily_mask & form_prob_mask
-        
-        # Make symmetric
         new_edges_mask = new_edges_mask | new_edges_mask.T
         
         if np.any(new_edges_mask):
-            # Each undirected edge appears as 2 true values in the symmetric mask
-            formed_count = np.sum(new_edges_mask) // 2
-            self._total_edges_formed += int(formed_count)
+            self._total_edges_formed += int(np.sum(new_edges_mask) // 2)
             self._adjacency[new_edges_mask] = 1.0
             self._fatigue[new_edges_mask] = 0
 
-        # ---- Aggregate ----
         total_delta = converge_delta + backfire_delta
         active_neighbors = np.maximum((converge_mask | backfire_mask).sum(axis=1), 1.0)
         mean_delta = total_delta.sum(axis=1) / active_neighbors
-
-        # Get top 3 influencers for each agent based on absolute influence magnitude
         abs_delta = np.abs(total_delta)
         top_influencers = np.argsort(abs_delta, axis=1)[:, -3:][:, ::-1]
 
         return np.clip(beliefs + mean_delta, -1.0, 1.0), top_influencers
 
     # ------------------------------------------------------------------
-    # API Hooks & Getters
+    # API Hooks
     # ------------------------------------------------------------------
 
     def get_active_influencers(self) -> np.ndarray:
-        """Returns indices of agents flagged for LLM generation."""
         n_influencers = max(1, int(np.ceil(self.n_agents * INFLUENCER_PERCENTILE)))
         top_indices = np.argpartition(self._last_belief_delta, -n_influencers)[-n_influencers:]
         sorted_order = np.argsort(self._last_belief_delta[top_indices])[::-1]
         return top_indices[sorted_order]
 
     def get_telemetry(self) -> dict[str, Any]:
-        """Return comprehensive telemetry and history."""
         if not self._history:
             beliefs = self._agents[:, COL_BELIEF]
             return {

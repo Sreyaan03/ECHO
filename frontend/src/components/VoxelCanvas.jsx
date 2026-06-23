@@ -47,6 +47,11 @@ const COLOR_PULSE = new THREE.Color('#B22222');   // Deep Brick Red
 const COLOR_HOVER = new THREE.Color('#FFE4B5');   // Moccasin highlight
 const COLOR_FACT_CHECKER = new THREE.Color('#FFFFFF'); // Bright White
 
+// Topic B Aesthetics
+const COLOR_B_LEFT = new THREE.Color('#4682B4');   // Steel Blue
+const COLOR_B_RIGHT = new THREE.Color('#FF8C00');  // Dark Orange
+const COLOR_BRIDGE = new THREE.Color('#FF00FF');   // Magenta for bridging nodes
+
 // ============================================================================
 // Force-Directed Physics Constants
 // ============================================================================
@@ -256,7 +261,7 @@ function ForceDirectedSimulation({ livePositionsRef }) {
 // ============================================================================
 function AgentNodes({ livePositionsRef }) {
   const meshRef = useRef();
-  const { agents, activeInfluencers, selectAgent, selectedAgentId } = useSimulationStore();
+  const { agents, activeInfluencers, selectAgent, selectedAgentId, activeTopicFilter } = useSimulationStore();
   const [hoveredId, setHoveredId] = useState(null);
 
   // Reusable Math objects to avoid garbage collection overhead in useFrame
@@ -314,17 +319,38 @@ function AgentNodes({ livePositionsRef }) {
       tempObject.updateMatrix();
       meshRef.current.setMatrixAt(i, tempObject.matrix);
 
-      // Dynamic Color calculation (Pulsing angry nodes brick red)
+      // Dynamic Color calculation
       let beliefColor = tempColor;
       const belief = agent.belief;
+      const beliefB = agent.belief_b || 0.0;
       const isFactChecker = agent.literacy === 1.0 && agent.gullibility <= 0.02;
 
       if (isFactChecker) {
         beliefColor.copy(COLOR_FACT_CHECKER);
-      } else if (belief < 0) {
-        beliefColor.lerpColors(COLOR_LEFT, COLOR_NEUTRAL, belief + 1.0);
       } else {
-        beliefColor.lerpColors(COLOR_NEUTRAL, COLOR_RIGHT, belief);
+        if (activeTopicFilter === 0) {
+          if (belief < 0) beliefColor.lerpColors(COLOR_LEFT, COLOR_NEUTRAL, belief + 1.0);
+          else beliefColor.lerpColors(COLOR_NEUTRAL, COLOR_RIGHT, belief);
+        } else if (activeTopicFilter === 1) {
+          if (beliefB < 0) beliefColor.lerpColors(COLOR_B_LEFT, COLOR_NEUTRAL, beliefB + 1.0);
+          else beliefColor.lerpColors(COLOR_NEUTRAL, COLOR_B_RIGHT, beliefB);
+        } else {
+          // Blended mode
+          let cA = new THREE.Color();
+          if (belief < 0) cA.lerpColors(COLOR_LEFT, COLOR_NEUTRAL, belief + 1.0);
+          else cA.lerpColors(COLOR_NEUTRAL, COLOR_RIGHT, belief);
+          
+          let cB = new THREE.Color();
+          if (beliefB < 0) cB.lerpColors(COLOR_B_LEFT, COLOR_NEUTRAL, beliefB + 1.0);
+          else cB.lerpColors(COLOR_NEUTRAL, COLOR_B_RIGHT, beliefB);
+          
+          beliefColor.lerpColors(cA, cB, 0.5);
+          
+          // Highlight bridging agents
+          if (Math.abs(belief) > 0.6 && Math.abs(beliefB) > 0.6) {
+            beliefColor.lerp(COLOR_BRIDGE, 0.4);
+          }
+        }
       }
 
       // If selected or hovered, highlight

@@ -93,11 +93,15 @@ export const useSimulationStore = create((set, get) => ({
   selectedAgentId: null,
   narrativeInput: 'The new water plant is poisoning the river',
   customRumor: 'I heard the local tap water tastes like metal...',
+  secondaryTopicInput: '',
+  topics: [],
+  activeTopicFilter: null,
   mutatedNarratives: [],
   reactionTemplate: '',
   injectionTemplate: '',
   defaultReactionTemplate: '',
   defaultInjectionTemplate: '',
+  narrativeProfile: null,
   telemetry: {
     current_tick: 0,
     polarization: 0,
@@ -114,7 +118,9 @@ export const useSimulationStore = create((set, get) => ({
   // Actions
   setConfig: (newConfig) => set((state) => ({ config: { ...state.config, ...newConfig } })),
   setNarrativeInput: (val) => set({ narrativeInput: val }),
+  setSecondaryTopicInput: (val) => set({ secondaryTopicInput: val }),
   setCustomRumor: (val) => set({ customRumor: val }),
+  setActiveTopicFilter: (val) => set({ activeTopicFilter: val }),
   selectAgent: (agentId) => set({ selectedAgentId: agentId }),
 
   initializeSimulation: async () => {
@@ -133,7 +139,11 @@ export const useSimulationStore = create((set, get) => ({
       const response = await fetch(`${API_BASE_URL}/initialize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...config, topic: get().narrativeInput })
+        body: JSON.stringify({ 
+          ...config, 
+          topic: get().narrativeInput,
+          secondary_topic: get().secondaryTopicInput || null 
+        })
       });
       
       if (!response.ok) throw new Error('Failed to initialize simulation backend');
@@ -151,8 +161,10 @@ export const useSimulationStore = create((set, get) => ({
         edgesFormed: 0,
         selectedAgentId: null,
         telemetry: data.telemetry,
-        mutatedNarratives: data.narrative_logs || []
+        mutatedNarratives: data.narrative_logs || [],
+        narrativeProfile: data.narrative_profile || null
       });
+      get().fetchTopics();
       get().connectWebSocket();
     } catch (error) {
       console.error('Initialization error:', error);
@@ -228,6 +240,7 @@ export const useSimulationStore = create((set, get) => ({
         const updatedAgents = get().agents.map((agent, index) => ({
           ...agent,
           belief: data.beliefs[index],
+          belief_b: data.beliefs_b ? data.beliefs_b[index] : 0.0,
           arousal: data.arousals[index]
         }));
 
@@ -254,6 +267,11 @@ export const useSimulationStore = create((set, get) => ({
           telemetry: telemetryData,
           mutatedNarratives: data.narrative_logs || []
         });
+        
+        // Optionally update topics every few ticks to get fresh avg beliefs
+        if (data.tick % 10 === 0) {
+            get().fetchTopics();
+        }
       } else if (msg.type === 'error') {
         console.error('WebSocket Error:', msg.message);
         get().pauseSimulation();
@@ -444,6 +462,18 @@ export const useSimulationStore = create((set, get) => ({
     }
   },
 
+  fetchTopics: async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/topics`);
+      if (response.ok) {
+        const data = await response.json();
+        set({ topics: data.topics });
+      }
+    } catch (error) {
+      console.error('Failed to fetch topics:', error);
+    }
+  },
+
   exportSession: async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/export`);
@@ -465,6 +495,48 @@ export const useSimulationStore = create((set, get) => ({
       alert('Failed to export session data.');
     }
   },
+
+  exportTelemetryCSV: () => {
+    const { currentTick } = get();
+    const a = document.createElement('a');
+    a.href = `${API_BASE_URL}/export/csv`;
+    a.download = `echo_telemetry_tick${currentTick}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  },
+
+  exportBeliefsCSV: () => {
+    const { currentTick } = get();
+    const a = document.createElement('a');
+    a.href = `${API_BASE_URL}/export/beliefs_csv`;
+    a.download = `echo_beliefs_tick${currentTick}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  },
+
+  exportConfig: async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/export/config`);
+      if (!response.ok) throw new Error('Failed to export config');
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `echo_config_seed${data.seed}_tick${data.total_ticks_run}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Config export error:', error);
+      alert('Failed to export config.');
+    }
+  },
+
+
 
   resetSimulation: () => {
     const { socket } = get();

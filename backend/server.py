@@ -1,6 +1,10 @@
 import logging
+import csv
+import io
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import tempfile
@@ -13,6 +17,9 @@ from RestrictedPython import compile_restricted, safe_builtins
 from opinion_engine.opinion_engine import OpinionEngine, Topology, TopologyParams
 from opinion_engine.llm_client import EchoLLMClient, DEFAULT_REACTION_TEMPLATE, DEFAULT_INJECTION_TEMPLATE
 from opinion_engine.data_pipeline import OSINTDataPipeline
+from opinion_engine.religion_registry import ReligionRegistry
+from opinion_engine.narrative_classifier import classify_narrative, NarrativeProfile
+from opinion_engine.contagion_manager import ContagionManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +42,8 @@ static_positions: Dict[int, Dict[str, float]] = {}
 narrative_logs: List[Dict[str, Any]] = []
 influencer_memory: Dict[int, List[str]] = {}
 influencer_strategy: Dict[int, str] = {}
+active_narrative_profile: Optional[NarrativeProfile] = None
+contagion_manager: Optional[ContagionManager] = None
 
 class ConnectionManager:
     def __init__(self):
@@ -82,6 +91,7 @@ class InitializeRequest(BaseModel):
     topology_params: Optional[TopologyParamsModel] = None
     fatigue_limit: int = 5
     topic: Optional[str] = None
+    secondary_topic: Optional[str] = None
     custom_edges: Optional[List[List[int]]] = None
     p_fact_checkers: float = 0.05
     p_bots: float = 0.0
@@ -109,8 +119,8 @@ def get_active_edges(opinion_graph: nx.Graph) -> List[List[int]]:
     return [[int(u), int(v)] for u, v in opinion_graph.edges()]
 
 @app.post("/api/initialize")
-def initialize_simulation(req: InitializeRequest):
-    global engine, static_positions, narrative_logs, influencer_memory, influencer_strategy
+async def initialize_simulation(req: InitializeRequest):
+    global engine, static_positions, narrative_logs, influencer_memory, influencer_strategy, active_narrative_profile, contagion_manager
     try:
         if req.topology == "scale_free":
             topo = Topology.SCALE_FREE
@@ -128,23 +138,60 @@ def initialize_simulation(req: InitializeRequest):
             t_params.sbm_p_in = req.topology_params.sbm_p_in
             t_params.sbm_p_out = req.topology_params.sbm_p_out
 
-        engine = OpinionEngine(
-            n_agents=req.n_agents,
-            topology=topo,
-            w_pol=req.w_pol,
-            w_econ=req.w_econ,
-            w_rel=req.w_rel,
-            d_tolerance=req.d_tolerance,
-            gamma=req.gamma,
-            topology_params=t_params,
-            n_religious_groups=req.n_religious_groups,
-            seed=req.seed,
-            fatigue_limit=req.fatigue_limit,
-            p_fact_checkers=req.p_fact_checkers,
-            p_bots=req.p_bots,
-            custom_edges=req.custom_edges,
-            belief_dist=req.belief_dist,
-        )
+        try:
+            registry = ReligionRegistry.load(os.path.join(os.path.dirname(__file__), "opinion_engine/religions.json"))
+            profile = await classify_narrative(req.topic, registry) if req.topic else None
+            active_narrative_profile = profile
+            
+            engine = OpinionEngine(
+                n_agents=req.n_agents,
+                topology=topo,
+                w_pol=req.w_pol,
+                w_econ=req.w_econ,
+                w_rel=req.w_rel,
+                d_tolerance=req.d_tolerance,
+                gamma=req.gamma,
+                topology_params=t_params,
+                n_religious_groups=req.n_religious_groups,
+                seed=req.seed,
+                fatigue_limit=req.fatigue_limit,
+                p_fact_checkers=req.p_fact_checkers,
+                p_bots=req.p_bots,
+                belief_dist=req.belief_dist,
+                religion_registry=registry,
+                narrative_profile=profile
+            )
+            
+            contagion_manager = None
+            if req.secondary_topic:
+                secondary_profile = await classify_narrative(req.secondary_topic, registry)
+                contagion_manager = ContagionManager()
+                contagion_manager.add_topic(
+                    topic_id=1,
+                    topic_name=req.secondary_topic,
+                    narrative_profile=secondary_profile,
+                    num_agents=req.n_agents,
+                    belief_dist=req.belief_dist,
+                    engine=engine,          # enables religion-aware belief seeding
+                )
+        except Exception as e:
+            logger.error(f"Failed to load religion registry or classifier: {e}. Falling back.")
+            engine = OpinionEngine(
+                n_agents=req.n_agents,
+                topology=topo,
+                w_pol=req.w_pol,
+                w_econ=req.w_econ,
+                w_rel=req.w_rel,
+                d_tolerance=req.d_tolerance,
+                gamma=req.gamma,
+                topology_params=t_params,
+                n_religious_groups=req.n_religious_groups,
+                seed=req.seed,
+                fatigue_limit=req.fatigue_limit,
+                p_fact_checkers=req.p_fact_checkers,
+                p_bots=req.p_bots,
+                belief_dist=req.belief_dist,
+            )
 
         # Clear logs and memory
         narrative_logs = []
@@ -161,7 +208,8 @@ def initialize_simulation(req: InitializeRequest):
                     "agent_id": 0,
                     "message": injection.post_text,
                     "bias": injection.encoded_bias,
-                    "provider": injection.provider.value
+                    "provider": injection.provider.value,
+                    "topic_id": 0
                 })
             except Exception as ex:
                 logger.warning(f"Failed to generate Patient Zero injection: {ex}")
@@ -191,11 +239,50 @@ def initialize_simulation(req: InitializeRequest):
             "edges": get_active_edges(graph),
             "positions": static_positions,
             "telemetry": engine.get_telemetry(),
-            "narrative_logs": narrative_logs
+            "narrative_logs": narrative_logs,
+            "narrative_profile": get_narrative_profile().get("profile")
         }
     except Exception as e:
         logger.error(f"Initialization error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/narrative_profile")
+def get_narrative_profile():
+    if not active_narrative_profile:
+        return {"profile": None}
+    import dataclasses
+    return {"profile": dataclasses.asdict(active_narrative_profile)}
+
+from fastapi import Body
+
+@app.get("/api/topics")
+def get_topics():
+    topics = []
+    if active_narrative_profile:
+        topics.append({
+            "topic_id": 0,
+            "name": active_narrative_profile.topic_name,
+            "avg_belief": float(np.mean(engine._agents[:, 3])) if engine else 0.0
+        })
+    if contagion_manager:
+        topic_b = contagion_manager.get_topic(1)
+        if topic_b:
+            topics.append({
+                "topic_id": 1,
+                "name": topic_b.topic_name,
+                "avg_belief": float(np.mean(topic_b.beliefs))
+            })
+    return {"topics": topics}
+
+@app.post("/api/inject_topic")
+def inject_topic(agent_id: int = Body(...), topic_id: int = Body(...), belief_score: float = Body(...)):
+    if topic_id == 0:
+        if engine:
+            engine.inject_narrative(agent_id, belief_score)
+    elif topic_id == 1:
+        if contagion_manager:
+            contagion_manager.inject_topic(agent_id, topic_id, belief_score)
+    return {"message": "Success"}
 
 @app.post("/api/upload_topology")
 async def upload_topology(
@@ -269,7 +356,7 @@ async def upload_topology(
         raise HTTPException(status_code=500, detail=str(e))
 
 def run_simulation_step():
-    global engine, narrative_logs, influencer_memory, influencer_strategy
+    global engine, narrative_logs, influencer_memory, influencer_strategy, contagion_manager
     if not engine:
         raise ValueError("Simulation not initialized.")
     
@@ -277,6 +364,13 @@ def run_simulation_step():
     try:
         # 1. Run physical dynamics tick
         result = engine.step()
+        
+        # 1b. Run secondary topic dynamics if active
+        if contagion_manager:
+            contagion_manager.step(engine, topic_id=1)
+            bridging_agents = contagion_manager.detect_bridging_agents(engine, topic_id_b=1)
+        else:
+            bridging_agents = []
         
         # 2. Run LLM Narrative Mutation Phase for active influencers
         active_influencers = result["active_influencers"]
@@ -309,7 +403,19 @@ def run_simulation_step():
                 if len(memory) > 3 and len(set(memory[-3:])) == 1:
                     engine._agents[influencer_id, 5] = 1.0 # Spike arousal (COL_AROUSAL=5)
                     
-                strategy = influencer_strategy.get(influencer_id, "")
+                # Format memory directly as past posts to ground the LLM
+                memory_posts = ""
+                if memory:
+                    memory_posts = "- " + "\n- ".join(memory[-3:])
+                    
+                current_topic = active_narrative_profile.topic_name if active_narrative_profile else "Unknown"
+                
+                is_bridging = influencer_id in bridging_agents
+                secondary_topic_str = None
+                secondary_belief_val = None
+                if is_bridging and contagion_manager and contagion_manager.get_topic(1):
+                    secondary_topic_str = contagion_manager.get_topic(1).topic_name
+                    secondary_belief_val = float(contagion_manager.get_topic(1).beliefs[influencer_id])
                 
                 try:
                     response = llm_client.evaluate_message(
@@ -318,7 +424,10 @@ def run_simulation_step():
                         stubbornness=stubbornness,
                         incoming_message_text=incoming["message"],
                         incoming_message_bias=incoming["bias"],
-                        memory_context=strategy
+                        topic=current_topic,
+                        secondary_topic=secondary_topic_str,
+                        secondary_belief=secondary_belief_val,
+                        memory_context=memory_posts
                     )
                     
                     if response.will_engage:
@@ -339,13 +448,15 @@ def run_simulation_step():
                         source_ids = [int(x) for x in top_inf[influencer_id]] if top_inf else []
                         
                         # Log the mutated message
+                        topic_val = "bridge" if is_bridging else 0
                         narrative_logs.append({
                             "tick": result["tick"],
                             "agent_id": int(influencer_id),
                             "message": mutated,
                             "bias": response.new_belief_score,
                             "provider": response.provider.value,
-                            "source_agent_ids": source_ids
+                            "source_agent_ids": source_ids,
+                            "topic_id": topic_val
                         })
                 except Exception as ex:
                     logger.warning(f"Failed to run LLM evaluation for agent {influencer_id}: {ex}")
@@ -356,6 +467,8 @@ def run_simulation_step():
         beliefs = states[:, 3].tolist() # COL_BELIEF
         arousals = states[:, 5].tolist() # COL_AROUSAL
         
+        beliefs_b = contagion_manager.get_topic(1).beliefs.tolist() if contagion_manager else []
+        
         return {
             "tick": result["tick"],
             "polarization": result["polarization"],
@@ -364,6 +477,7 @@ def run_simulation_step():
             "edges_formed": result["edges_formed"],
             "active_influencers": result["active_influencers"],
             "beliefs": beliefs,
+            "beliefs_b": beliefs_b,
             "arousals": arousals,
             "edges": get_active_edges(engine.get_graph()),
             "narrative_logs": narrative_logs
@@ -516,6 +630,118 @@ def export_session():
         "final_polarization": telemetry.get("polarization", 0),
         "agents": agents_data,
         "edges": get_active_edges(engine.get_graph())
+    }
+
+
+@app.get("/api/export/csv")
+def export_telemetry_csv():
+    """Stream per-tick aggregate metrics as a CSV file for research analysis."""
+    if not engine or not engine._history:
+        raise HTTPException(status_code=400, detail="No simulation data to export. Run at least one tick first.")
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "tick", "polarization", "avg_belief",
+            "edges_severed", "edges_formed", "edge_count", "n_active_influencers"
+        ])
+        yield buf.getvalue()
+        buf.truncate(0)
+        buf.seek(0)
+
+        for t in engine._history:
+            writer.writerow([
+                t.tick,
+                round(t.polarization, 6),
+                round(t.avg_belief, 6),
+                t.edges_severed,
+                t.edges_formed,
+                t.edge_count,
+                len(t.active_influencers),
+            ])
+            yield buf.getvalue()
+            buf.truncate(0)
+            buf.seek(0)
+
+    filename = f"echo_telemetry_tick{engine._tick}.csv"
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/export/beliefs_csv")
+def export_beliefs_csv():
+    """Stream the full N-agent belief trajectory matrix as CSV (one row per tick)."""
+    if not engine or not engine._history:
+        raise HTTPException(status_code=400, detail="No simulation data to export. Run at least one tick first.")
+
+    n = engine.n_agents
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        # Header: tick, agent_0_belief, agent_1_belief, ...
+        header = ["tick"] + [f"agent_{i}_belief" for i in range(n)]
+        writer.writerow(header)
+        yield buf.getvalue()
+        buf.truncate(0)
+        buf.seek(0)
+
+        for t in engine._history:
+            row = [t.tick] + [round(b, 6) for b in t.belief_snapshot]
+            writer.writerow(row)
+            yield buf.getvalue()
+            buf.truncate(0)
+            buf.seek(0)
+
+    filename = f"echo_beliefs_tick{engine._tick}.csv"
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/export/config")
+def export_config():
+    """Return the full reproducible experiment configuration as a JSON object."""
+    if not engine:
+        raise HTTPException(status_code=400, detail="Simulation not initialized.")
+
+    tp = engine.topology_params
+    return {
+        "echo_version": "1.0.0",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "seed": engine.seed,
+        "n_agents": engine.n_agents,
+        "topology": engine.topology_type.value,
+        "topology_params": {
+            "m": tp.m,
+            "k": tp.k,
+            "p": tp.p,
+            "sbm_blocks": tp.sbm_blocks,
+            "sbm_p_in": tp.sbm_p_in,
+            "sbm_p_out": tp.sbm_p_out,
+        },
+        "w_pol": engine.w_pol,
+        "w_econ": engine.w_econ,
+        "w_rel": engine.w_rel,
+        "d_tolerance": engine.d_tolerance,
+        "gamma": engine.gamma,
+        "fatigue_limit": engine.fatigue_limit,
+        "arousal_decay": engine.arousal_decay,
+        "extremism_threshold": engine.extremism_threshold,
+        "skepticism_threshold": engine.skepticism_threshold,
+        "p_fact_checkers": engine.p_fact_checkers,
+        "p_bots": engine.p_bots,
+        "belief_dist": engine.belief_dist,
+        "n_religious_groups": engine.n_religious_groups,
+        "total_ticks_run": engine._tick,
+        "final_polarization": round(engine._history[-1].polarization, 6) if engine._history else None,
+        "final_avg_belief": round(engine._history[-1].avg_belief, 6) if engine._history else None,
     }
 
 class UpdatePromptsRequest(BaseModel):
