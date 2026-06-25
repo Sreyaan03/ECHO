@@ -18,12 +18,22 @@ from opinion_engine.opinion_engine import OpinionEngine, Topology, TopologyParam
 from opinion_engine.llm_client import EchoLLMClient, DEFAULT_REACTION_TEMPLATE, DEFAULT_INJECTION_TEMPLATE
 from opinion_engine.data_pipeline import OSINTDataPipeline
 from opinion_engine.religion_registry import ReligionRegistry
+from opinion_engine.economic_registry import EconomicRegistry
 from opinion_engine.narrative_classifier import classify_narrative, NarrativeProfile
 from opinion_engine.contagion_manager import ContagionManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("echo.server")
+
+# ---------------------------------------------------------------------------
+# Region Configuration
+# To switch demographic data to a different region, change this one constant.
+# The folder must exist under backend/opinion_engine/data/<REGION>/
+# and contain both religions.json and economics.json.
+# ---------------------------------------------------------------------------
+DATA_REGION = "india"
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "opinion_engine", "data", DATA_REGION)
 
 app = FastAPI(title="ECHO Simulation API")
 
@@ -139,7 +149,25 @@ async def initialize_simulation(req: InitializeRequest):
             t_params.sbm_p_out = req.topology_params.sbm_p_out
 
         try:
-            registry = ReligionRegistry.load(os.path.join(os.path.dirname(__file__), "opinion_engine/religions.json"))
+            religion_path = os.path.join(_DATA_DIR, "religions.json")
+            economics_path = os.path.join(_DATA_DIR, "economics.json")
+
+            registry = ReligionRegistry.load(religion_path)
+
+            # Load the economic registry, passing n_religions so the
+            # religion_conditional_matrix column count can be validated.
+            try:
+                economic_registry = EconomicRegistry.load(
+                    economics_path,
+                    n_religions=registry.n_religions
+                )
+            except Exception as econ_err:
+                logger.warning(
+                    f"Could not load economics.json ({econ_err}). "
+                    f"Falling back to continuous COL_ECONOMIC behavior."
+                )
+                economic_registry = None
+
             profile = await classify_narrative(req.topic, registry) if req.topic else None
             active_narrative_profile = profile
             
@@ -159,6 +187,7 @@ async def initialize_simulation(req: InitializeRequest):
                 p_bots=req.p_bots,
                 belief_dist=req.belief_dist,
                 religion_registry=registry,
+                economic_registry=economic_registry,
                 narrative_profile=profile
             )
             

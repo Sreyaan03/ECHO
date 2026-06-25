@@ -71,8 +71,8 @@ class ReligionRegistry:
     @classmethod
     def load(cls, filepath: str) -> 'ReligionRegistry':
         if not os.path.exists(filepath):
-            # Fallback path if run from backend root vs opinion_engine dir
-            fallback = os.path.join(os.path.dirname(__file__), "religions.json")
+            # Fallback: look for the file in data/india/ relative to this module
+            fallback = os.path.join(os.path.dirname(__file__), "data", "india", "religions.json")
             if os.path.exists(fallback):
                 filepath = fallback
             else:

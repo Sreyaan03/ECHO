@@ -1,0 +1,87 @@
+{
+  "version": "1.0",
+  "region": "India",
+  "region_note": "This file is region-scoped. To change regions, update 'region', 'demographic_weight' values in 'classes', and all matrices to reflect the target country's class distribution and inter-religious composition.",
+  "model": "Guy Standing Precariat (2011)",
+  "model_note": "Change 'model' to 'Neo-Marxist', 'SES Quintile', etc. for documentation purposes only. The engine ignores this field. To swap models entirely, replace the 'classes' array and all three matrices. Zero Python changes required.",
+
+  "classes": [
+    {
+      "id": 0,
+      "name": "Elite",
+      "demographic_weight": 0.01,
+      "demographic_weight_note": "~1% of India's population. Industrialists, top politicians, ultra-HNIs.",
+      "economic_anxiety_multiplier": 0.1,
+      "economic_anxiety_multiplier_note": "Scale [0.0-1.0]. Multiplied against the narrative's initial_arousal_spike for economic topics. 0.1 = Elites are barely emotionally reactive to economic shocks.",
+      "base_literacy_range": [0.7, 1.0],
+      "base_literacy_range_note": "[min, max] for COL_LITERACY uniform draw. Elites have consistently high media literacy.",
+      "political_lean_bias": 0.6,
+      "political_lean_bias_note": "Added to U(-1, 1) political draw and clipped to [-1, 1]. Positive = skews Right. Elites strongly favor right-of-centre economic policy.",
+      "authority_figure": "CEO / Billionaire"
+    },
+    {
+      "id": 1,
+      "name": "Salariat",
+      "demographic_weight": 0.15,
+      "demographic_weight_note": "~15% of India's population. Salaried government/corporate employees with job security.",
+      "economic_anxiety_multiplier": 0.3,
+      "base_literacy_range": [0.5, 0.85],
+      "political_lean_bias": 0.2,
+      "political_lean_bias_note": "Mildly right-leaning. Favour stability and the status quo.",
+      "authority_figure": "Corporate Manager / Senior Bureaucrat"
+    },
+    {
+      "id": 2,
+      "name": "Proficians",
+      "demographic_weight": 0.09,
+      "demographic_weight_note": "~9% of India's population. High-skill freelancers, tech workers, consultants. High income but no job security.",
+      "economic_anxiety_multiplier": 0.25,
+      "base_literacy_range": [0.55, 0.9],
+      "political_lean_bias": -0.1,
+      "political_lean_bias_note": "Slightly left-leaning on social issues, economically pragmatic.",
+      "authority_figure": "Tech Influencer / Startup Founder"
+    },
+    {
+      "id": 3,
+      "name": "Old Working Class",
+      "demographic_weight": 0.30,
+      "demographic_weight_note": "~30% of India's population. Factory workers, skilled tradespeople, unionized labour.",
+      "economic_anxiety_multiplier": 0.65,
+      "base_literacy_range": [0.1, 0.5],
+      "political_lean_bias": -0.4,
+      "political_lean_bias_note": "Left-leaning on economic issues, susceptible to populist narratives about globalization and factory closures.",
+      "authority_figure": "Union Leader / Local Politician"
+    },
+    {
+      "id": 4,
+      "name": "Precariat",
+      "demographic_weight": 0.45,
+      "demographic_weight_note": "~45% of India's population. Gig workers, daily wage labourers, domestic workers, informal economy. The largest class.",
+      "economic_anxiety_multiplier": 0.95,
+      "economic_anxiety_multiplier_note": "Near maximum. This class is extremely reactive to economic narratives (inflation, job loss, unemployment).",
+      "base_literacy_range": [0.0, 0.35],
+      "base_literacy_range_note": "Very low media literacy. Highly susceptible to misinformation and emotionally charged narratives.",
+      "political_lean_bias": -0.7,
+      "political_lean_bias_note": "Strong left/populist lean. Frequently mobilized by religious-nationalist and populist rhetoric simultaneously.",
+      "authority_figure": "Street Agitator / Religious Leader"
+    }
+  ],
+
+  "friction_matrix": [
+    [0.00, 0.10, 0.15, 0.50, 0.80],
+    [0.10, 0.00, 0.10, 0.25, 0.55],
+    [0.15, 0.10, 0.00, 0.20, 0.45],
+    [0.50, 0.25, 0.20, 0.00, 0.15],
+    [0.80, 0.55, 0.45, 0.15, 0.00]
+  ],
+  "friction_matrix_note": "C×C matrix indexed by class id. friction_matrix[i][j] = sociological friction between class i and class j. RULES: (1) Must be square — C rows and C columns. (2) Diagonal must be 0.0 (no self-friction). (3) Should be symmetric. To add a new class: append a new row AND a new column to every existing row.",
+
+  "religion_conditional_matrix": [
+    [0.45, 0.10, 0.05, 0.40],
+    [0.60, 0.15, 0.05, 0.20],
+    [0.65, 0.18, 0.07, 0.10],
+    [0.75, 0.16, 0.06, 0.03],
+    [0.78, 0.17, 0.04, 0.01]
+  ],
+  "religion_conditional_matrix_note": "C×R matrix. P(Religion | Class). Row index = class ID (0=Elite, 1=Salariat, 2=Proficians, 3=Old Working Class, 4=Precariat). Column index = religion ID — MUST match the ordering in religions.json (0=Hindu, 1=Muslim, 2=Christian, 3=Atheist). Each row must sum to 1.0 (auto-normalized with a warning if not). To add a new religion: append one column to EVERY row. To add a new class: append one new row. Pattern: lower classes are progressively more religious (Precariat is 99% religious, Elites are 40% Atheist)."
+}

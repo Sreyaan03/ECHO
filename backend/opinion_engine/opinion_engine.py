@@ -134,6 +134,7 @@ class OpinionEngine:
         custom_adjacency: Optional[np.ndarray] = None,
         custom_anchors: Optional[list[int]] = None,
         religion_registry: Optional[Any] = None,
+        economic_registry: Optional[Any] = None,
         narrative_profile: Optional[Any] = None,
     ) -> None:
         # Configuration
@@ -158,6 +159,7 @@ class OpinionEngine:
         self.belief_dist = belief_dist
         
         self.religion_registry = religion_registry
+        self.economic_registry = economic_registry
         self.narrative_profile = narrative_profile
 
         # Engine State
@@ -202,57 +204,154 @@ class OpinionEngine:
     # ------------------------------------------------------------------
 
     def _init_agents(self) -> np.ndarray:
-        """Create the N×9 agent attribute matrix with random distributions."""
+        """
+        Create the N×9 agent attribute matrix using a conditional initialization
+        pipeline. When an EconomicRegistry is present, attributes are NOT drawn
+        independently — they follow a sociologically realistic dependency chain:
+
+            Economic Class
+                └── Religion (conditional on class)
+                └── Political Leaning (biased by class)
+                └── Media Literacy (ranged by class)
+                    Religion
+                        └── Gullibility (conditional on religion, unchanged)
+                    Class + Religion + Narrative
+                        └── Initial Arousal (compounded)
+
+        If no EconomicRegistry is loaded, the engine falls back to the
+        previous independent-draw behavior so existing simulations are unaffected.
+        """
         agents = np.empty((self.n_agents, 9), dtype=np.float64)
 
-        # Sociological Anchors
-        agents[:, COL_POLITICAL] = self._rng.uniform(-1.0, 1.0, self.n_agents)
-        agents[:, COL_ECONOMIC] = self._rng.uniform(0.0, 1.0, self.n_agents)
-        
-        if self.religion_registry:
+        # ------------------------------------------------------------------
+        # Step 1: Assign Economic Class (COL_ECONOMIC)
+        # ------------------------------------------------------------------
+        if self.economic_registry:
+            # Discrete class ID drawn by demographic weights
+            agents[:, COL_ECONOMIC] = self._rng.choice(
+                self.economic_registry.n_classes,
+                size=self.n_agents,
+                p=self.economic_registry.demographic_weights
+            ).astype(np.float64)
+        else:
+            # Fallback: continuous float (legacy behavior)
+            agents[:, COL_ECONOMIC] = self._rng.uniform(0.0, 1.0, self.n_agents)
+
+        # ------------------------------------------------------------------
+        # Step 2: Assign Religion (COL_RELIGION) — conditional on class
+        # ------------------------------------------------------------------
+        if self.economic_registry and self.religion_registry:
+            # For each agent, use their class row in religion_conditional_matrix
+            class_ids = agents[:, COL_ECONOMIC].astype(int)
+            religion_ids = np.empty(self.n_agents, dtype=np.float64)
+            for c_id in range(self.economic_registry.n_classes):
+                class_mask = class_ids == c_id
+                if not np.any(class_mask):
+                    continue
+                weights = self.economic_registry.get_religion_weights_for_class(c_id)
+                religion_ids[class_mask] = self._rng.choice(
+                    self.religion_registry.n_religions,
+                    size=class_mask.sum(),
+                    p=weights
+                ).astype(np.float64)
+            agents[:, COL_RELIGION] = religion_ids
+        elif self.religion_registry:
+            # Fallback: unconditional draw from global religion weights
             agents[:, COL_RELIGION] = self._rng.choice(
                 self.religion_registry.n_religions,
                 size=self.n_agents,
                 p=self.religion_registry.demographic_weights
             ).astype(np.float64)
         else:
-            agents[:, COL_RELIGION] = self._rng.integers(1, self.n_religious_groups + 1, self.n_agents).astype(np.float64)
-        
-        # Dynamic State
+            agents[:, COL_RELIGION] = self._rng.integers(
+                1, self.n_religious_groups + 1, self.n_agents
+            ).astype(np.float64)
+
+        # ------------------------------------------------------------------
+        # Step 3: Assign Political Leaning (COL_POLITICAL) — biased by class
+        # ------------------------------------------------------------------
+        base_political = self._rng.uniform(-1.0, 1.0, self.n_agents)
+        if self.economic_registry:
+            class_ids = agents[:, COL_ECONOMIC].astype(int)
+            biases = self.economic_registry.political_lean_biases[class_ids]
+            agents[:, COL_POLITICAL] = np.clip(base_political + biases, -1.0, 1.0)
+        else:
+            agents[:, COL_POLITICAL] = base_political
+
+        # ------------------------------------------------------------------
+        # Step 4: Assign Media Literacy (COL_LITERACY) — ranged by class
+        # ------------------------------------------------------------------
+        if self.economic_registry:
+            class_ids = agents[:, COL_ECONOMIC].astype(int)
+            literacy = np.empty(self.n_agents, dtype=np.float64)
+            for c_id in range(self.economic_registry.n_classes):
+                class_mask = class_ids == c_id
+                if not np.any(class_mask):
+                    continue
+                lo, hi = self.economic_registry.get_literacy_range(c_id)
+                literacy[class_mask] = self._rng.uniform(lo, hi, class_mask.sum())
+            agents[:, COL_LITERACY] = literacy
+        else:
+            agents[:, COL_LITERACY] = self._rng.uniform(0.0, 1.0, self.n_agents)
+
+        # ------------------------------------------------------------------
+        # Step 5: Dynamic Belief initialization
+        # ------------------------------------------------------------------
         if self.belief_dist == "normal":
-            agents[:, COL_BELIEF] = np.clip(self._rng.normal(0.0, 0.3, self.n_agents), -1.0, 1.0)
+            agents[:, COL_BELIEF] = np.clip(
+                self._rng.normal(0.0, 0.3, self.n_agents), -1.0, 1.0
+            )
         elif self.belief_dist == "bimodal":
             mask = self._rng.choice([True, False], size=self.n_agents)
             left_peak = self._rng.normal(-0.6, 0.2, self.n_agents)
             right_peak = self._rng.normal(0.6, 0.2, self.n_agents)
-            beliefs = np.where(mask, left_peak, right_peak)
-            agents[:, COL_BELIEF] = np.clip(beliefs, -1.0, 1.0)
-        else: # uniform
+            agents[:, COL_BELIEF] = np.clip(
+                np.where(mask, left_peak, right_peak), -1.0, 1.0
+            )
+        else:  # uniform
             agents[:, COL_BELIEF] = self._rng.uniform(-1.0, 1.0, self.n_agents)
-        
-        # Psychological Traits
+
+        # ------------------------------------------------------------------
+        # Step 6: Assign Gullibility (COL_GULLIBILITY) — conditional on religion
+        # ------------------------------------------------------------------
         agents[:, COL_GULLIBILITY] = self._rng.uniform(0.01, 0.4, self.n_agents)
-        
         if self.religion_registry:
             for r_id in range(self.religion_registry.n_religions):
                 mask = agents[:, COL_RELIGION] == r_id
                 r_range = self.religion_registry.profiles[r_id].base_gullibility_range
-                agents[mask, COL_GULLIBILITY] = self._rng.uniform(r_range[0], r_range[1], mask.sum())
+                agents[mask, COL_GULLIBILITY] = self._rng.uniform(
+                    r_range[0], r_range[1], mask.sum()
+                )
 
+        # ------------------------------------------------------------------
+        # Step 7: Assign Initial Arousal (COL_AROUSAL)
+        # Compounded: narrative group_sensitivity × initial_arousal_spike
+        #             × class economic_anxiety_multiplier
+        # ------------------------------------------------------------------
         agents[:, COL_AROUSAL] = 0.0
         if self.narrative_profile and self.religion_registry:
             for r_id, name in enumerate(self.religion_registry.names):
-                mask = agents[:, COL_RELIGION] == r_id
+                rel_mask = agents[:, COL_RELIGION] == r_id
+                if not np.any(rel_mask):
+                    continue
                 sens = self.narrative_profile.group_sensitivity.get(name, 0.3)
-                agents[mask, COL_AROUSAL] = sens * self.narrative_profile.initial_arousal_spike
-                
-        agents[:, COL_LITERACY] = self._rng.uniform(0.0, 1.0, self.n_agents)
+                base_arousal = sens * self.narrative_profile.initial_arousal_spike
 
-        # Default all to not bot and not cleric
+                if self.economic_registry:
+                    # Scale arousal by each agent's class anxiety multiplier
+                    class_ids = agents[rel_mask, COL_ECONOMIC].astype(int)
+                    anxiety = self.economic_registry.anxiety_multipliers[class_ids]
+                    agents[rel_mask, COL_AROUSAL] = base_arousal * anxiety
+                else:
+                    agents[rel_mask, COL_AROUSAL] = base_arousal
+
+        # ------------------------------------------------------------------
+        # Step 8: Special agent types (Bots, Clerics, Fact-Checkers)
+        # ------------------------------------------------------------------
         agents[:, COL_IS_BOT] = 0.0
         agents[:, COL_IS_CLERIC] = 0.0
-        
-        # Assign Clerics
+
+        # Assign Clerics (one per religious group)
         if self.religion_registry:
             for r_id in range(self.religion_registry.n_religions):
                 candidates = np.where(agents[:, COL_RELIGION] == r_id)[0]
@@ -262,6 +361,7 @@ class OpinionEngine:
                     agents[cleric_id, COL_GULLIBILITY] = 0.0
 
         # Apply Fact-Checkers
+        fc_indices = np.array([], dtype=int)
         n_fact_checkers = int(self.n_agents * self.p_fact_checkers)
         if n_fact_checkers > 0:
             fc_indices = self._rng.choice(self.n_agents, n_fact_checkers, replace=False)
@@ -272,11 +372,13 @@ class OpinionEngine:
         # Apply Bots
         n_bots = int(self.n_agents * self.p_bots)
         if n_bots > 0:
-            non_fc_indices = np.setdiff1d(np.arange(self.n_agents), fc_indices if n_fact_checkers > 0 else [])
-            bot_indices = self._rng.choice(non_fc_indices, min(n_bots, len(non_fc_indices)), replace=False)
+            non_fc_indices = np.setdiff1d(np.arange(self.n_agents), fc_indices)
+            bot_indices = self._rng.choice(
+                non_fc_indices, min(n_bots, len(non_fc_indices)), replace=False
+            )
             agents[bot_indices, COL_IS_BOT] = 1.0
             agents[bot_indices, COL_LITERACY] = 0.0
-            agents[bot_indices, COL_GULLIBILITY] = 0.0 
+            agents[bot_indices, COL_GULLIBILITY] = 0.0
             half_bots = len(bot_indices) // 2
             agents[bot_indices[:half_bots], COL_BELIEF] = 1.0
             agents[bot_indices[half_bots:], COL_BELIEF] = -1.0
@@ -313,20 +415,39 @@ class OpinionEngine:
     # ------------------------------------------------------------------
 
     def _compute_social_distance_matrix(self) -> np.ndarray:
-        """Compute the N×N social distance matrix D(i,j) via broadcasting."""
+        """
+        Compute the N×N social distance matrix D(i,j) via broadcasting.
+
+        When an EconomicRegistry is loaded, COL_ECONOMIC contains discrete
+        class IDs and economic distance is looked up from the friction matrix
+        (a sociologically grounded measure of class conflict) rather than
+        computed as a simple arithmetic difference.
+
+        Without an EconomicRegistry, falls back to the original continuous
+        absolute-difference behavior.
+        """
         P = self._agents[:, COL_POLITICAL]
-        E = self._agents[:, COL_ECONOMIC]
         R = self._agents[:, COL_RELIGION].astype(np.int32)
 
         pol_dist = np.abs(P[:, None] - P[None, :])
-        econ_dist = np.abs(E[:, None] - E[None, :])
         rel_match = (R[:, None] == R[None, :]).astype(np.float64)
 
+        # Economic distance: friction matrix lookup (discrete) or raw diff (continuous)
+        if self.economic_registry:
+            C = self._agents[:, COL_ECONOMIC].astype(np.int32)
+            # Clip to valid range in case of any edge-case initialization artifacts
+            C = np.clip(C, 0, self.economic_registry.n_classes - 1)
+            econ_dist = self.economic_registry.friction_matrix[C[:, None], C[None, :]]
+        else:
+            E = self._agents[:, COL_ECONOMIC]
+            econ_dist = np.abs(E[:, None] - E[None, :])
+
         base_dist = self.w_pol * pol_dist + self.w_econ * econ_dist - self.w_rel * rel_match
-        
+
+        # Add religious inter-group friction on top if registry is loaded
         if self.religion_registry:
-            friction = self.religion_registry.friction_matrix[R[:, None], R[None, :]]
-            return base_dist + friction
+            rel_friction = self.religion_registry.friction_matrix[R[:, None], R[None, :]]
+            return base_dist + rel_friction
         else:
             return base_dist
 
