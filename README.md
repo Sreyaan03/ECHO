@@ -9,8 +9,13 @@
 [![Three.js](https://img.shields.io/badge/Three.js-R3F-000000?logo=three.js)](https://threejs.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen.svg)](https://echo-silk-alpha.vercel.app)
 
 Watch 500 AI agents form echo chambers, sever relationships, and radicalize — powered by real sociological models and LLM-generated narratives.
+
+### ▶ [Launch the Live Demo](https://echo-silk-alpha.vercel.app)
+
+*First load may take ~30–50s while the free backend wakes from idle, then click **Initialize Simulation**.*
 
 </div>
 
@@ -110,7 +115,7 @@ Unlike toy simulations, ECHO produces **emergent behavior**: echo chambers, netw
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ECHO.git
+git clone https://github.com/Sreyaan03/ECHO.git
 cd ECHO
 
 # Backend dependencies
